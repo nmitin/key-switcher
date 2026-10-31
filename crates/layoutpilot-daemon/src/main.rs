@@ -635,14 +635,21 @@ impl Daemon {
         }
 
         let previous_layout = self.active_layout;
-        self.injector.tap_backspace(plan.backspaces)?;
+        // Switch first and let XWayland/KDE settle: on KDE the keymap may be
+        // reloaded asynchronously, and a trailing space sent too early can be
+        // lost. Backspace is layout-independent, so editing after the switch is
+        // safe and lets us abort before touching text if switching fails.
         self.layouts.switch_to(plan.layout)?;
+        if previous_layout != Some(plan.layout) {
+            std::thread::sleep(Duration::from_millis(self.config.inject.layout_settle_ms));
+        }
+        self.injector.tap_backspace(plan.backspaces)?;
         self.injector.tap_text(&plan.text, plan.layout.table())?;
         if let Some(separator) = plan.separator {
-            // Give the application a moment to finish the replacement before
-            // sending the separator as a separate key event. This avoids the
-            // final space being lost in the same fast XTest batch.
-            std::thread::sleep(Duration::from_millis(2));
+            // Send the separator as a separate, delayed key event. Some
+            // XWayland clients (Kate/Geany) drop it when it follows a layout
+            // switch too closely.
+            std::thread::sleep(Duration::from_millis(self.config.inject.separator_delay_ms));
             self.injector
                 .tap_text(&separator.to_string(), plan.layout.table())?;
         }
@@ -880,6 +887,10 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
         } else {
             String::new()
         }
+    );
+    println!(
+        "inject delays: layout_settle_ms={}, separator_delay_ms={}",
+        config.inject.layout_settle_ms, config.inject.separator_delay_ms
     );
 
     match X11HotkeyGrabber::new() {

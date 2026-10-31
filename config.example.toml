@@ -33,6 +33,8 @@ backend = "auto"                   # auto | xtest | eis | virtual-keyboard | uin
 allow_uinput_in_games = false
 restore_clipboard = true
 request_permission_on_start = true   # Wayland: one Shift tap triggers the XTest permission prompt
+layout_settle_ms = 20               # пауза после смены раскладки
+separator_delay_ms = 20            # пауза перед пробелом/Enter
 
 [layout]
 backend = "auto"                   # auto | kde | gnome | sway | hyprland | x11

@@ -293,6 +293,10 @@ pub struct InjectConfig {
     /// Ask the compositor for input-injection permission at startup by
     /// sending a harmless Shift tap. Only used on Wayland.
     pub request_permission_on_start: bool,
+    /// Pause after switching layout before editing text, in milliseconds.
+    pub layout_settle_ms: u64,
+    /// Pause before typing the separator, in milliseconds.
+    pub separator_delay_ms: u64,
 }
 
 impl Default for InjectConfig {
@@ -302,6 +306,8 @@ impl Default for InjectConfig {
             allow_uinput_in_games: false,
             restore_clipboard: true,
             request_permission_on_start: true,
+            layout_settle_ms: 20,
+            separator_delay_ms: 20,
         }
     }
 }

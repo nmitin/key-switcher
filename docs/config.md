@@ -103,7 +103,13 @@ X11-окружениях остаётся XKB group lock.
 ```toml
 [inject]
 request_permission_on_start = true
+layout_settle_ms = 20
+separator_delay_ms = 20
 ```
+
+`layout_settle_ms` — пауза после смены раскладки перед Backspace/текстом;
+`separator_delay_ms` — пауза перед пробелом/Enter. Если Kate/Geany теряют
+последний пробел, увеличьте `separator_delay_ms` до 50–100 мс.
 
 На Wayland KDE первый XTest-ввод может вызвать запрос «Удалённое управление».
 Чтобы он не появлялся в момент набора текста, демон при старте делает один
