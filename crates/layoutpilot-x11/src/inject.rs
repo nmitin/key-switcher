@@ -1,0 +1,124 @@
+//! XTest injection backend.
+
+use layoutpilot_core::{Keystroke, LayoutTable};
+use x11rb::connection::{Connection, RequestConnection};
+use x11rb::protocol::xproto::{self, Window};
+use x11rb::protocol::xtest::ConnectionExt as _;
+use x11rb::rust_connection::RustConnection;
+
+use crate::error::X11Error;
+
+/// Standard evdev keycode for Backspace.
+pub const BACKSPACE_KEYCODE: u8 = 22;
+/// Standard evdev keycode for Shift.
+pub const SHIFT_KEYCODE: u8 = 50;
+
+/// Injects key events through the XTEST extension.
+#[derive(Debug)]
+pub struct X11Injector {
+    connection: RustConnection,
+    root: Window,
+}
+
+impl X11Injector {
+    /// Connect to `$DISPLAY` and check that XTEST is available.
+    pub fn new() -> Result<Self, X11Error> {
+        let (connection, screen) = RustConnection::connect(None)?;
+        let root = connection.setup().roots[screen].root;
+
+        if connection
+            .extension_information(x11rb::protocol::xtest::X11_EXTENSION_NAME)?
+            .is_none()
+        {
+            return Err(X11Error::MissingExtension("XTEST"));
+        }
+        connection.xtest_get_version(2, 2)?.reply()?;
+
+        Ok(Self { connection, root })
+    }
+
+    /// Tap one physical key, optionally with Shift.
+    pub fn tap_keycode(&mut self, keycode: u8, shift: bool) -> Result<(), X11Error> {
+        self.queue_keycode(keycode, shift)?;
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    /// Tap a [`Keystroke`] from the layout table.
+    pub fn tap_keystroke(&mut self, keystroke: Keystroke) -> Result<(), X11Error> {
+        let keycode = u8::try_from(keystroke.keycode)
+            .map_err(|_| X11Error::KeycodeOutOfRange(keystroke.keycode))?;
+        self.tap_keycode(keycode, keystroke.needs_shift())
+    }
+
+    /// Type text using the physical keys of `layout`.
+    ///
+    /// The method batches requests and flushes once. If a character has no key
+    /// in the layout, nothing is flushed and `UnsupportedChar` is returned.
+    pub fn tap_text(&mut self, text: &str, layout: &LayoutTable) -> Result<(), X11Error> {
+        // Validate and translate everything first so that an unsupported
+        // character cannot leave a partially queued replacement.
+        let mut keycodes = Vec::with_capacity(text.chars().count());
+        for ch in text.chars() {
+            let keystroke = layout
+                .keystroke_for(ch)
+                .ok_or(X11Error::UnsupportedChar(ch))?;
+            let keycode = u8::try_from(keystroke.keycode)
+                .map_err(|_| X11Error::KeycodeOutOfRange(keystroke.keycode))?;
+            keycodes.push((keycode, keystroke.needs_shift()));
+        }
+        for (keycode, shift) in keycodes {
+            self.queue_keycode(keycode, shift)?;
+        }
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    /// Press Backspace `count` times.
+    pub fn tap_backspace(&mut self, count: usize) -> Result<(), X11Error> {
+        for _ in 0..count {
+            self.queue_keycode(BACKSPACE_KEYCODE, false)?;
+        }
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    /// Send a key press.
+    pub fn press_keycode(&mut self, keycode: u8) -> Result<(), X11Error> {
+        self.fake(xproto::KEY_PRESS_EVENT, keycode)?;
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    /// Send a key release.
+    pub fn release_keycode(&mut self, keycode: u8) -> Result<(), X11Error> {
+        self.fake(xproto::KEY_RELEASE_EVENT, keycode)?;
+        self.connection.flush()?;
+        Ok(())
+    }
+
+    fn queue_keycode(&mut self, keycode: u8, shift: bool) -> Result<(), X11Error> {
+        if shift {
+            self.fake(xproto::KEY_PRESS_EVENT, SHIFT_KEYCODE)?;
+        }
+        self.fake(xproto::KEY_PRESS_EVENT, keycode)?;
+        self.fake(xproto::KEY_RELEASE_EVENT, keycode)?;
+        if shift {
+            self.fake(xproto::KEY_RELEASE_EVENT, SHIFT_KEYCODE)?;
+        }
+        Ok(())
+    }
+
+    fn fake(&self, event_type: u8, keycode: u8) -> Result<(), X11Error> {
+        self.connection.xtest_fake_input(
+            event_type,
+            keycode,
+            x11rb::CURRENT_TIME,
+            self.root,
+            0,
+            0,
+            0,
+        )?;
+        Ok(())
+    }
+}

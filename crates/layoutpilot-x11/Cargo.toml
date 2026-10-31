@@ -1,0 +1,14 @@
+[package]
+name = "layoutpilot-x11"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "X11 backends for LayoutPilot: XTest injection, XKB state and focus"
+
+[dependencies]
+layoutpilot-core = { path = "../layoutpilot-core" }
+x11rb = { version = "0.13", features = ["xtest", "record", "xkb", "xinput"] }
+
+[lints]
+workspace = true

@@ -33,6 +33,14 @@
 - undo/redo с инвалидацией при любом новом вводе или сбросе контекста (FR-04);
 - `Action::Replace/Undo/Redo` с числом Backspace и текстом для инжектора.
 
+`layoutpilot-x11` — первый платформенный срез:
+
+- XTest-инъекция (keycode, Shift, Backspace, текст по таблице);
+- XKB: текущая группа, активная раскладка, переключение;
+- XRecord-захват глобальных KeyPress/KeyRelease;
+- активное окно, `WM_CLASS` и заголовок;
+- нормализация keycode → символ с учётом Shift/CapsLock.
+
 `layoutpilot-dict` — словари и production-детектор:
 
 - FST-словари ru/en по 50k слов из FrequencyWords;
@@ -84,6 +92,7 @@ crates/
   layoutpilot-layouts/   таблицы XKB и физические привязки
   layoutpilot-core/      конвертация, сегментация, буфер, движок
   layoutpilot-dict/      FST-словари, биграммы, DictionaryDetector
+  layoutpilot-x11/       XTest, XRecord, XKB state, фокус
 data/
   xkb/                   сгенерированные таблицы и их происхождение
   dict/                  FrequencyWords (CC BY-SA 4.0), FST собирается из них
@@ -110,8 +119,10 @@ cargo test --workspace
   считаются неизвестными.
 - Нет word-bigram контекста и layout prior; калибровка температуры и
   `known_bias` предварительная (этап 3).
-- Нет платформенных бэкендов (evdev, X11, Wayland), менеджера инъекции и
-  реального undo-хука в приложении.
+- Платформенный слой начат с X11: есть XTest, XRecord и XKB. Нет evdev,
+  Wayland-инъекции, менеджера инъекции и реального undo-хука в приложении.
+- XRecord видит только X11/XWayland-приложения; layout state пока опрашивается
+  по требованию, без `XkbStateNotify`.
 - Резолвер профилей есть, но интеграция с фокусом/`app_id` появится вместе с
   платформенным слоем.
 
