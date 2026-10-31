@@ -1,7 +1,8 @@
 //! End-to-end checks: the scored detector behind the real engine.
 
 use layoutpilot_core::{
-    Action, Engine, EngineConfig, EngineState, InputContext, LayoutId, Profile,
+    Action, CorrectionManager, Engine, EngineConfig, EngineState, InputContext, LayoutId, PlanKind,
+    Profile,
 };
 use layoutpilot_dict::DictionaryDetector;
 
@@ -32,6 +33,24 @@ fn replacement(action: Option<Action>) -> layoutpilot_core::Correction {
         Some(Action::Replace(correction)) => correction,
         other => panic!("expected Replace, got {other:?}"),
     }
+}
+
+#[test]
+fn manager_builds_a_real_correction_plan() {
+    let mut manager = CorrectionManager::new(EngineConfig::default(), DictionaryDetector::new());
+    let context = context(Profile::Auto, LayoutId::Us);
+    let mut plan = None;
+    for ch in "ghbdtn ".chars() {
+        if let Some(next) = manager.on_char(ch, &context) {
+            plan = Some(next);
+        }
+    }
+    let plan = plan.expect("plan");
+    assert_eq!(plan.kind, PlanKind::Replace);
+    assert_eq!(plan.layout, LayoutId::Ru);
+    assert_eq!(plan.backspaces, 7);
+    assert_eq!(plan.text, "привет ");
+    assert!(plan.is_typeable());
 }
 
 #[test]

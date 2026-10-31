@@ -5,6 +5,7 @@ members = [
     "crates/layoutpilot-core",
     "crates/layoutpilot-dict",
     "crates/layoutpilot-x11",
+    "crates/layoutpilot-daemon",
 ]
 
 [workspace.package]

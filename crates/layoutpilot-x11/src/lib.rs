@@ -25,4 +25,4 @@ pub use error::X11Error;
 pub use focus::{FocusInfo, X11Focus};
 pub use inject::{X11Injector, SHIFT_KEYCODE};
 pub use layout::X11LayoutState;
-pub use normalize::char_for;
+pub use normalize::{char_for, modifiers};

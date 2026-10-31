@@ -357,6 +357,17 @@ impl<D: Detector> Engine<D> {
         None
     }
 
+    /// Process a Backspace: drop the last character and invalidate undo.
+    pub fn on_backspace(&mut self) {
+        self.undo = None;
+        self.current_word.pop();
+        self.buffer.pop();
+        self.next_word_attached = false;
+        if self.current_word.is_empty() {
+            self.word_tainted = false;
+        }
+    }
+
     /// Manually convert the word currently being typed (FR-03).
     ///
     /// This bypasses the minimum length and confidence checks, but still needs
@@ -726,6 +737,26 @@ mod tests {
         assert!(matches!(engine.undo(), Some(Action::Undo(_))));
         assert!(engine.undo_available());
         assert!(matches!(engine.undo(), Some(Action::Redo(_))));
+    }
+
+    #[test]
+    fn backspace_removes_the_last_character() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "ghbdtn", &auto());
+        engine.on_backspace();
+        assert_eq!(engine.current_word(), "ghbdt");
+        assert_eq!(engine.buffer_text(), "ghbdt");
+        engine.on_backspace();
+        assert_eq!(engine.current_word(), "ghbd");
+    }
+
+    #[test]
+    fn backspace_invalidates_undo() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "ghbdtn ", &auto());
+        assert!(engine.undo_available());
+        engine.on_backspace();
+        assert!(!engine.undo_available());
     }
 
     #[test]

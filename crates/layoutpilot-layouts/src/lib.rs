@@ -272,8 +272,8 @@ mod tests {
 
     #[test]
     fn tables_are_not_empty() {
-        assert_eq!(us().len(), 95);
-        assert_eq!(ru().len(), 94);
+        assert_eq!(us().len(), 98);
+        assert_eq!(ru().len(), 98);
         assert!(!us().is_empty());
     }
 

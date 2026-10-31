@@ -10,6 +10,7 @@ pub mod buffer;
 pub mod conversion;
 pub mod detector;
 pub mod engine;
+pub mod manager;
 pub mod profile;
 pub mod protection;
 pub mod segmenter;
@@ -21,6 +22,7 @@ pub use conversion::{
 pub use detector::{DetectionContext, Detector, LexiconDetector, StaticDetector};
 pub use engine::{Action, Correction, Engine, EngineState, InputContext, Modifiers, ResetReason};
 pub use layoutpilot_layouts::{Keystroke, LayoutId, LayoutTable};
+pub use manager::{CorrectionManager, CorrectionPlan, PlanKind};
 pub use profile::{glob_match, AppRule, EngineConfig, Profile, ProfileResolver};
 pub use protection::{is_protected_context, is_protected_token};
 pub use segmenter::{is_word_char, last_word, tokenize, Token, TokenKind, WordSlice};

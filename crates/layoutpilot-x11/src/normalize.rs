@@ -1,6 +1,6 @@
 //! Normalize X11 key events into characters using the XKB layout tables.
 
-use layoutpilot_core::{Keystroke, LayoutTable};
+use layoutpilot_core::{Keystroke, LayoutTable, Modifiers};
 use x11rb::protocol::xproto::KeyButMask;
 
 use crate::capture::KeyEvent;
@@ -24,6 +24,18 @@ pub fn char_for(event: &KeyEvent, layout: &LayoutTable) -> Option<char> {
         1
     };
     layout.char_at(Keystroke::new(keycode, level))
+}
+
+/// Extract the modifier snapshot for the engine policy.
+#[must_use]
+pub fn modifiers(event: &KeyEvent) -> Modifiers {
+    let bit = |mask: KeyButMask| event.state & u16::from(mask) != 0;
+    Modifiers {
+        ctrl: bit(KeyButMask::CONTROL),
+        alt: bit(KeyButMask::MOD1),
+        shift: bit(KeyButMask::SHIFT),
+        super_key: bit(KeyButMask::MOD4),
+    }
 }
 
 #[cfg(test)]
@@ -76,6 +88,18 @@ mod tests {
             ),
             Some('-')
         );
+    }
+
+    #[test]
+    fn extracts_modifiers() {
+        let state = u16::from(KeyButMask::SHIFT)
+            | u16::from(KeyButMask::CONTROL)
+            | u16::from(KeyButMask::MOD4);
+        let modifiers = modifiers(&event(24, state));
+        assert!(modifiers.shift);
+        assert!(modifiers.ctrl);
+        assert!(modifiers.super_key);
+        assert!(!modifiers.alt);
     }
 
     #[test]

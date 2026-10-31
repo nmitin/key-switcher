@@ -104,6 +104,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "layoutpilot-daemon"
+version = "0.1.0"
+dependencies = [
+ "layoutpilot-core",
+ "layoutpilot-dict",
+ "layoutpilot-x11",
+]
+
+[[package]]
 name = "layoutpilot-dict"
 version = "0.1.0"
 dependencies = [

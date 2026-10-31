@@ -105,9 +105,16 @@ def canonical_row(rows: list[dict[str, str]]) -> dict[str, str] | None:
     return usable[0]
 
 
-def generate(layout: str) -> tuple[list[tuple[str, int, int, str]], list[str]]:
-    """Return entries (layout_id, keycode, level, char) and warnings."""
-    entries: dict[tuple[int, int, int], str] = {}
+def generate_order(
+    layout: str, order: tuple[str, str]
+) -> tuple[dict[tuple[str, int, int], str], list[str]]:
+    """Return entries for one XKB layout order.
+
+    `xkbcli how-to-type` reports only one group for symbols shared by both
+    groups (space, digits, some punctuation). Generating with both "us,ru" and
+    "ru,us" and merging fills both tables.
+    """
+    entries: dict[tuple[str, int, int], str] = {}
     warnings: list[str] = []
     for char in CHARS:
         rows = how_to_type(char, layout)
@@ -120,20 +127,37 @@ def generate(layout: str) -> tuple[list[tuple[str, int, int, str]], list[str]]:
             found_in_layout = True
             keycode = int(row["keycode"])
             level = 2 if row["mods"].strip() == "Shift" else 1
-            slot = (layout_no, keycode, level)
+            slot = (order[layout_no - 1], keycode, level)
             if slot in entries and entries[slot] != char:
                 warnings.append(
-                    f"conflict at layout {layout_no}, keycode {keycode}, level {level}: "
+                    f"conflict at {slot[0]}, keycode {keycode}, level {level}: "
                     f"{entries[slot]!r} vs {char!r}; keeping first"
                 )
                 continue
             entries[slot] = char
         if not found_in_layout:
             warnings.append(f"no direct access for {char!r}")
+    return entries, warnings
+
+
+def generate(layout: str) -> tuple[list[tuple[str, int, int, str]], list[str]]:
+    """Generate both orders and merge the results."""
+    merged: dict[tuple[str, int, int], str] = {}
+    warnings: list[str] = []
+    for spec, order in ((layout, tuple(LAYOUT_NAMES.values())), ("ru,us", ("ru", "us"))):
+        entries, run_warnings = generate_order(spec, order)
+        warnings.extend(run_warnings)
+        for slot, char in entries.items():
+            if slot in merged and merged[slot] != char:
+                warnings.append(
+                    f"merge conflict at {slot}: {merged[slot]!r} vs {char!r}; keeping first"
+                )
+                continue
+            merged[slot] = char
 
     result = [
-        (LAYOUT_NAMES[layout_no], keycode, level, char)
-        for (layout_no, keycode, level), char in entries.items()
+        (layout_id, keycode, level, char)
+        for (layout_id, keycode, level), char in merged.items()
     ]
     result.sort(key=lambda entry: (entry[0], entry[1], entry[2]))
     return result, warnings

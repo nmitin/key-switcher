@@ -98,6 +98,25 @@ Production-реализация — `layoutpilot_dict::DictionaryDetector`:
 `LexiconDetector` остаётся в ядре как простой детектор для unit-тестов.
 Подробности и замеры — [`docs/dictionaries.md`](dictionaries.md).
 
+## Менеджер коррекции
+
+`CorrectionManager` владеет движком и превращает `Action` в
+`CorrectionPlan`:
+
+```text
+CorrectionPlan {
+    kind:       Replace | Undo | Redo,
+    layout:     куда переключиться,
+    backspaces: сколько раз нажать Backspace,
+    text:       что напечатать (включая разделитель),
+}
+```
+
+Для `Replace` источник — текущая раскладка, цель — `source.other()`. Для
+`Undo`/`Redo` направление берётся из последней коррекции. `is_typeable()`
+проверяет, что каждый символ плана есть на клавишах целевой раскладки; это
+делается до удаления текста, чтобы не оставить полуисправленное состояние.
+
 ## Действия и undo
 
 `Action::Replace(Correction)` содержит:

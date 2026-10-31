@@ -4,7 +4,7 @@ Generated from the system XKB data by `tools/gen_xkb_tables.py`.
 
 - XKB layout spec: `us,ru`
 - `xkbcli` version: `1.13.2`
-- entries: 189
+- entries: 196
 
 Regenerate on a machine with `xkbcommon-tools` installed:
 

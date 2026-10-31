@@ -1,14 +1,15 @@
 # LayoutPilot
 
 Автопереключатель раскладки клавиатуры для Linux. Проект находится на раннем
-этапе: готовы платформенно-независимое ядро, движок и словарный скоринг;
-платформенные бэкенды (evdev, X11, Wayland) ещё не реализованы.
+этапе: готовы платформенно-независимое ядро, движок, словарный скоринг и
+X11-демон; evdev и Wayland-бэкенды ещё не реализованы.
 
 - ТЗ: [`tz-layout-switcher-v0.2.md`](tz-layout-switcher-v0.2.md)
 - Решения: [`docs/decisions.md`](docs/decisions.md)
 - Программа спайков: [`docs/stage-0-checklist.md`](docs/stage-0-checklist.md)
 - Движок: [`docs/engine.md`](docs/engine.md)
 - Словари и скоринг: [`docs/dictionaries.md`](docs/dictionaries.md)
+- Демон: [`docs/daemon.md`](docs/daemon.md)
 
 ## Что уже работает
 
@@ -32,6 +33,14 @@
 - `Detector`-трейт для вероятности кандидата;
 - undo/redo с инвалидацией при любом новом вводе или сбросе контекста (FR-04);
 - `Action::Replace/Undo/Redo` с числом Backspace и текстом для инжектора.
+
+`layoutpilot-daemon` — исполняемый вертикальный срез для X11:
+
+- XRecord → нормализация → `Engine`/`DictionaryDetector` → XTest + XKB;
+- `doctor` для проверки XTEST, XKB, RECORD, фокуса и словарей;
+- `run --dry-run` для просмотра планов без инъекции;
+- подавление собственных XTest-событий по журналу инъектора;
+- профили по `WM_CLASS` (терминалы — `manual`, KeePass — `off`).
 
 `layoutpilot-x11` — первый платформенный срез:
 
@@ -81,6 +90,8 @@ cargo run -p layoutpilot-core --example engine -- "ghbdtn "
 # replace "ghbdtn" -> "привет": Backspace x7, insert "привет "
 cargo run -p layoutpilot-dict --example detect -- ghbdtn привет
 cargo run -p layoutpilot-dict --example calibrate -- 5000
+cargo run -p layoutpilot-daemon -- doctor
+cargo run -p layoutpilot-daemon -- run --dry-run
 ```
 
 Требуется Rust 1.85+ и системные XKB-данные только для перегенерации таблиц.
@@ -93,6 +104,7 @@ crates/
   layoutpilot-core/      конвертация, сегментация, буфер, движок
   layoutpilot-dict/      FST-словари, биграммы, DictionaryDetector
   layoutpilot-x11/       XTest, XRecord, XKB state, фокус
+  layoutpilot-daemon/    бинарник layoutpilot: capture → engine → inject
 data/
   xkb/                   сгенерированные таблицы и их происхождение
   dict/                  FrequencyWords (CC BY-SA 4.0), FST собирается из них
@@ -119,10 +131,12 @@ cargo test --workspace
   считаются неизвестными.
 - Нет word-bigram контекста и layout prior; калибровка температуры и
   `known_bias` предварительная (этап 3).
-- Платформенный слой начат с X11: есть XTest, XRecord и XKB. Нет evdev,
-  Wayland-инъекции, менеджера инъекции и реального undo-хука в приложении.
+- Платформенный слой начат с X11: есть демон, XTest, XRecord и XKB. Нет evdev,
+  Wayland-инъекции, глобальных хоткеев и per-window раскладки.
 - XRecord видит только X11/XWayland-приложения; layout state пока опрашивается
   по требованию, без `XkbStateNotify`.
+- Порядок XKB-групп фиксирован (`us`, `ru`); конфиг и автоопределение ещё
+  не сделаны.
 - Резолвер профилей есть, но интеграция с фокусом/`app_id` появится вместе с
   платформенным слоем.
 

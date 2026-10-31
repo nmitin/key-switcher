@@ -64,6 +64,11 @@ impl CharBuffer {
         evicted
     }
 
+    /// Remove and return the last character.
+    pub fn pop(&mut self) -> Option<char> {
+        self.chars.pop_back()
+    }
+
     /// Append a string character by character.
     pub fn push_str(&mut self, text: &str) {
         for ch in text.chars() {
@@ -133,6 +138,16 @@ mod tests {
         assert_eq!(buffer.capacity(), 1);
         buffer.push_str("ab");
         assert_eq!(buffer.text(), "b");
+    }
+
+    #[test]
+    fn pops_the_last_character() {
+        let mut buffer = CharBuffer::default();
+        buffer.push_str("ab");
+        assert_eq!(buffer.pop(), Some('b'));
+        assert_eq!(buffer.text(), "a");
+        assert_eq!(buffer.pop(), Some('a'));
+        assert_eq!(buffer.pop(), None);
     }
 
     #[test]

@@ -18,6 +18,7 @@ pub const SHIFT_KEYCODE: u8 = 50;
 pub struct X11Injector {
     connection: RustConnection,
     root: Window,
+    sent: Vec<(u8, bool)>,
 }
 
 impl X11Injector {
@@ -34,7 +35,11 @@ impl X11Injector {
         }
         connection.xtest_get_version(2, 2)?.reply()?;
 
-        Ok(Self { connection, root })
+        Ok(Self {
+            connection,
+            root,
+            sent: Vec::new(),
+        })
     }
 
     /// Tap one physical key, optionally with Shift.
@@ -109,7 +114,25 @@ impl X11Injector {
         Ok(())
     }
 
-    fn fake(&self, event_type: u8, keycode: u8) -> Result<(), X11Error> {
+    /// Events sent since the last call, for own-event suppression (FR-09).
+    #[must_use]
+    pub fn sent_events(&self) -> &[(u8, bool)] {
+        &self.sent
+    }
+
+    /// Drain the recorded events.
+    pub fn take_sent_events(&mut self) -> Vec<(u8, bool)> {
+        std::mem::take(&mut self.sent)
+    }
+
+    /// Forget recorded events without returning them.
+    pub fn clear_sent_events(&mut self) {
+        self.sent.clear();
+    }
+
+    fn fake(&mut self, event_type: u8, keycode: u8) -> Result<(), X11Error> {
+        self.sent
+            .push((keycode, event_type == xproto::KEY_PRESS_EVENT));
         self.connection.xtest_fake_input(
             event_type,
             keycode,
