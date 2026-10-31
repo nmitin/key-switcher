@@ -107,8 +107,9 @@ layout_settle_ms = 20
 separator_delay_ms = 20
 ```
 
-`layout_settle_ms` — пауза после смены раскладки перед Backspace/текстом;
-`separator_delay_ms` — пауза перед пробелом/Enter. Если Kate/Geany теряют
+`layout_settle_ms` — пауза после смены раскладки перед текстом;
+`separator_delay_ms` — пауза перед пробелом/Enter. Backspace выполняется до
+переключения раскладки, чтобы не потерять нажатие при перезагрузке keymap. Если Kate/Geany теряют
 последний пробел, увеличьте `separator_delay_ms` до 50–100 мс.
 
 На Wayland KDE первый XTest-ввод может вызвать запрос «Удалённое управление».

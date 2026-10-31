@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use layoutpilot_capture::{EvdevCapture, EvdevKeyEvent};
 use layoutpilot_compositor::KdeLayouts;
-use layoutpilot_config::{CaptureBackend, Config, Hotkey, InjectBackend, LayoutBackend};
+use layoutpilot_config::{CaptureBackend, Config, Hotkey, InjectBackend, LayoutBackend, Trigger};
 use layoutpilot_core::{
     CorrectionManager, CorrectionPlan, InputContext, LayoutId, Profile, ProfileResolver,
     ResetReason,
@@ -339,6 +339,8 @@ struct Daemon {
     clear_on_focus_change: bool,
     ignore: VecDeque<(u8, bool)>,
     ignore_until: Instant,
+    pending_enter: bool,
+    enter_ignore_until: Instant,
     evdev_modifiers: EvdevModifiers,
     dry_run: bool,
 }
@@ -391,6 +393,8 @@ impl Daemon {
             clear_on_focus_change,
             ignore: VecDeque::new(),
             ignore_until: Instant::now(),
+            pending_enter: false,
+            enter_ignore_until: Instant::now(),
             evdev_modifiers: EvdevModifiers::default(),
             dry_run,
         };
@@ -410,7 +414,7 @@ impl Daemon {
         );
         loop {
             self.poll_hotkeys()?;
-            if Instant::now() >= self.ignore_until {
+            if Instant::now() >= self.ignore_until && !self.ignore.is_empty() {
                 self.ignore.clear();
             }
 
@@ -471,7 +475,17 @@ impl Daemon {
         if self.consume_own(&event) {
             return Ok(());
         }
+        if event.keycode == RETURN_KEYCODE
+            && event.pressed
+            && Instant::now() < self.enter_ignore_until
+        {
+            return Ok(());
+        }
         if !event.pressed {
+            if event.keycode == RETURN_KEYCODE && self.pending_enter {
+                self.pending_enter = false;
+                self.handle_char('\n', &event)?;
+            }
             return Ok(());
         }
         self.last_input = Instant::now();
@@ -498,7 +512,14 @@ impl Daemon {
                 return Ok(());
             }
             RETURN_KEYCODE => {
-                self.handle_char('\n', &event)?;
+                if self.config.general.triggers.contains(&Trigger::Enter) {
+                    // Wait for the physical Enter release before injecting:
+                    // injecting while Enter is held makes the final newline
+                    // unreliable and can desynchronise own-event suppression.
+                    self.pending_enter = true;
+                } else {
+                    self.handle_char('\n', &event)?;
+                }
                 return Ok(());
             }
             TAB_KEYCODE => {
@@ -635,15 +656,13 @@ impl Daemon {
         }
 
         let previous_layout = self.active_layout;
-        // Switch first and let XWayland/KDE settle: on KDE the keymap may be
-        // reloaded asynchronously, and a trailing space sent too early can be
-        // lost. Backspace is layout-independent, so editing after the switch is
-        // safe and lets us abort before touching text if switching fails.
+        // Delete first, while the old layout is still active: switching the
+        // layout reloads the XWayland keymap and can swallow one Backspace.
+        self.injector.tap_backspace(plan.backspaces)?;
         self.layouts.switch_to(plan.layout)?;
         if previous_layout != Some(plan.layout) {
             std::thread::sleep(Duration::from_millis(self.config.inject.layout_settle_ms));
         }
-        self.injector.tap_backspace(plan.backspaces)?;
         self.injector.tap_text(&plan.text, plan.layout.table())?;
         if let Some(separator) = plan.separator {
             // Send the separator as a separate, delayed key event. Some
@@ -660,6 +679,11 @@ impl Daemon {
 
         self.ignore.extend(self.injector.take_sent_events());
         self.ignore_until = Instant::now() + IGNORE_WINDOW;
+        if plan.separator == Some('\n') {
+            // Synthetic Return can be captured again and start a second
+            // correction. Ignore Return presses for a short window.
+            self.enter_ignore_until = Instant::now() + Duration::from_millis(300);
+        }
         println!(
             "layoutpilot: {:?} → layout {}, {} backspaces, {:?}",
             plan.kind, plan.layout, plan.backspaces, plan.text
@@ -668,11 +692,16 @@ impl Daemon {
     }
 
     fn consume_own(&mut self, event: &KeyEvent) -> bool {
-        let Some(&(keycode, pressed)) = self.ignore.front() else {
-            return false;
-        };
-        if keycode == event.keycode && pressed == event.pressed {
-            self.ignore.pop_front();
+        // Do not rely on strict front-of-queue order: XRecord may interleave
+        // physical releases or lose a synthetic event. Matching anywhere in the
+        // window prevents an injected Backspace from being treated as a real
+        // Backspace (which would trigger backspace-undo and corrupt the text).
+        let found = self
+            .ignore
+            .iter()
+            .position(|&(keycode, pressed)| keycode == event.keycode && pressed == event.pressed);
+        if let Some(index) = found {
+            self.ignore.remove(index);
             true
         } else {
             false
