@@ -86,6 +86,15 @@ impl Hotkey {
         })
     }
 
+    /// X11/evdev modifier mask required by this hotkey.
+    #[must_use]
+    pub fn modifier_mask(&self) -> u16 {
+        (u16::from(self.ctrl) * MOD_CONTROL)
+            | (u16::from(self.alt) * MOD_ALT)
+            | (u16::from(self.shift) * MOD_SHIFT)
+            | (u16::from(self.super_key) * MOD_SUPER)
+    }
+
     /// Whether the keycode and modifier state match this hotkey.
     ///
     /// Caps Lock and Num Lock are ignored; all other extra modifiers prevent a
@@ -95,11 +104,7 @@ impl Hotkey {
         if keycode != self.keycode {
             return false;
         }
-        let expected = (u16::from(self.ctrl) * MOD_CONTROL)
-            | (u16::from(self.alt) * MOD_ALT)
-            | (u16::from(self.shift) * MOD_SHIFT)
-            | (u16::from(self.super_key) * MOD_SUPER);
-        (state & MOD_MASK) == expected
+        (state & MOD_MASK) == self.modifier_mask()
     }
 }
 

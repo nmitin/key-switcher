@@ -11,6 +11,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::error::Error;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -23,7 +24,8 @@ use layoutpilot_core::{
 };
 use layoutpilot_dict::{DictionaryDetector, Language};
 use layoutpilot_x11::{
-    char_for, modifiers, KeyEvent, X11Focus, X11Injector, X11LayoutState, XRecordCapture,
+    char_for, modifiers, KeyEvent, X11Focus, X11HotkeyGrabber, X11Injector, X11LayoutState,
+    XRecordCapture,
 };
 
 const BACKSPACE_KEYCODE: u8 = 22;
@@ -32,7 +34,7 @@ const TAB_KEYCODE: u8 = 23;
 const ESCAPE_KEYCODE: u8 = 9;
 const IGNORE_WINDOW: Duration = Duration::from_millis(750);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HotkeyAction {
     Undo,
     Fix,
@@ -204,6 +206,9 @@ struct Daemon {
     manager: CorrectionManager<DictionaryDetector>,
     resolver: ProfileResolver,
     hotkeys: Hotkeys,
+    hotkey_grabber: Option<X11HotkeyGrabber>,
+    grabbed_hotkeys: HashSet<HotkeyAction>,
+    last_hotkey: Option<(HotkeyAction, Instant)>,
     paused: bool,
     active_layout: Option<LayoutId>,
     profile: Profile,
@@ -231,6 +236,7 @@ impl Daemon {
         let focus = X11Focus::new()?;
         let active_layout = layouts.active_layout().ok().flatten();
         let hotkeys = Hotkeys::from_config(&config)?;
+        let (hotkey_grabber, grabbed_hotkeys) = setup_hotkey_grabber(&hotkeys);
         let resolver = config.to_profile_resolver();
         let profile = resolver.resolve("");
         let idle_timeout = Duration::from_millis(config.privacy.buffer_idle_timeout_ms.max(1));
@@ -239,6 +245,9 @@ impl Daemon {
         let mut daemon = Self {
             manager: CorrectionManager::new(config.to_engine_config(), DictionaryDetector::new()),
             hotkeys,
+            hotkey_grabber,
+            grabbed_hotkeys,
+            last_hotkey: None,
             paused: false,
             config,
             capture,
@@ -273,11 +282,12 @@ impl Daemon {
             self.app_id
         );
         loop {
+            self.poll_hotkeys()?;
             if Instant::now() >= self.ignore_until {
                 self.ignore.clear();
             }
 
-            match self.capture.recv_timeout(Duration::from_millis(200)) {
+            match self.capture.recv_timeout(Duration::from_millis(50)) {
                 Ok(Some(event)) => {
                     self.refresh_layout();
                     self.refresh_focus(false);
@@ -340,7 +350,9 @@ impl Daemon {
         self.last_input = Instant::now();
 
         if let Some(action) = self.hotkeys.action(u16::from(event.keycode), event.state) {
-            self.handle_hotkey(action, &event)?;
+            if !self.grabbed_hotkeys.contains(&action) {
+                self.handle_hotkey(action, &event)?;
+            }
             return Ok(());
         }
         if self.paused {
@@ -376,11 +388,37 @@ impl Daemon {
         self.handle_char(ch, &event)
     }
 
+    fn poll_hotkeys(&mut self) -> Result<(), Box<dyn Error>> {
+        let events = match self.hotkey_grabber.as_ref() {
+            Some(grabber) => grabber.poll_events()?,
+            None => return Ok(()),
+        };
+        for event in events {
+            self.last_input = Instant::now();
+            if let Some(action) = self.hotkeys.action(u16::from(event.keycode), event.state) {
+                let key = KeyEvent {
+                    keycode: event.keycode,
+                    state: event.state,
+                    time: 0,
+                    pressed: true,
+                };
+                self.handle_hotkey(action, &key)?;
+            }
+        }
+        Ok(())
+    }
+
     fn handle_hotkey(
         &mut self,
         action: HotkeyAction,
         event: &KeyEvent,
     ) -> Result<(), Box<dyn Error>> {
+        if let Some((last_action, at)) = self.last_hotkey {
+            if last_action == action && at.elapsed() < Duration::from_millis(400) {
+                return Ok(());
+            }
+        }
+        self.last_hotkey = Some((action, Instant::now()));
         match action {
             HotkeyAction::Pause => {
                 self.paused = !self.paused;
@@ -413,6 +451,7 @@ impl Daemon {
                 }
             }
         }
+        let _ = std::io::stdout().flush();
         Ok(())
     }
 
@@ -526,6 +565,42 @@ impl Daemon {
     }
 }
 
+fn setup_hotkey_grabber(hotkeys: &Hotkeys) -> (Option<X11HotkeyGrabber>, HashSet<HotkeyAction>) {
+    let mut grabbed = HashSet::new();
+    if env::var_os("DISPLAY").is_none() {
+        return (None, grabbed);
+    }
+    let mut grabber = match X11HotkeyGrabber::new() {
+        Ok(grabber) => grabber,
+        Err(error) => {
+            eprintln!("layoutpilot: XGrabKey unavailable: {error}; hotkeys stay passive");
+            return (None, grabbed);
+        }
+    };
+    for (action, hotkey) in [
+        (HotkeyAction::Undo, hotkeys.undo),
+        (HotkeyAction::Fix, hotkeys.fix),
+        (HotkeyAction::Pause, hotkeys.pause),
+    ] {
+        let Some(hotkey) = hotkey else {
+            continue;
+        };
+        match grabber.grab(hotkey.keycode, hotkey.modifier_mask()) {
+            Ok(()) => {
+                grabbed.insert(action);
+            }
+            Err(error) => {
+                eprintln!("layoutpilot: cannot grab {action:?} hotkey ({error}); it stays passive");
+            }
+        }
+    }
+    println!(
+        "layoutpilot: grabbed {} of 3 hotkeys (XGrabKey)",
+        grabbed.len()
+    );
+    (Some(grabber), grabbed)
+}
+
 fn open_capture(config: &Config) -> Result<Capture, Box<dyn Error>> {
     let backend = match config.capture.backend {
         CaptureBackend::Auto if env::var_os("DISPLAY").is_some() => CaptureBackend::Xrecord,
@@ -585,6 +660,17 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
         "hotkeys: undo={:?}, fix={:?}, pause={:?}",
         config.general.undo_hotkey, config.general.fix_hotkey, config.general.pause_hotkey
     );
+
+    match X11HotkeyGrabber::new() {
+        Ok(mut grabber) => {
+            println!("XGrabKey: ok");
+            grabber.ungrab_all();
+        }
+        Err(error) => {
+            failures += 1;
+            println!("XGrabKey: FAIL ({error})");
+        }
+    }
 
     match X11Injector::new() {
         Ok(_) => println!("XTEST: ok"),

@@ -16,6 +16,7 @@
 mod capture;
 mod error;
 mod focus;
+mod hotkeys;
 mod inject;
 mod layout;
 mod normalize;
@@ -23,6 +24,7 @@ mod normalize;
 pub use capture::{KeyEvent, XRecordCapture};
 pub use error::X11Error;
 pub use focus::{FocusInfo, X11Focus};
+pub use hotkeys::{HotkeyEvent, X11HotkeyGrabber};
 pub use inject::{X11Injector, SHIFT_KEYCODE};
 pub use layout::X11LayoutState;
 pub use normalize::{char_for, modifiers};
