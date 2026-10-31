@@ -121,10 +121,14 @@ impl SoundPlayer {
         if !self.enabled || self.failed {
             return;
         }
-        if self.spawn("canberra-gtk-play", &["--id=bell"]) {
+        const SOUND: &str = "/usr/share/sounds/freedesktop/stereo/dialog-information.oga";
+        if std::path::Path::new(SOUND).exists() && self.spawn("paplay", &[SOUND]) {
             return;
         }
-        if self.spawn("paplay", &["/usr/share/sounds/freedesktop/stereo/bell.oga"]) {
+        if self.spawn("pw-play", &[SOUND]) {
+            return;
+        }
+        if self.spawn("canberra-gtk-play", &["--id=bell"]) {
             return;
         }
         self.failed = true;
@@ -139,8 +143,13 @@ impl SoundPlayer {
             .stderr(Stdio::null());
         match command.spawn() {
             Ok(mut child) => {
+                println!("layoutpilot: layout sound via {program}");
                 std::thread::spawn(move || {
-                    let _ = child.wait();
+                    if let Ok(status) = child.wait() {
+                        if !status.success() {
+                            eprintln!("layoutpilot: sound player exited with {status}");
+                        }
+                    }
                 });
                 true
             }
