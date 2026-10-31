@@ -46,7 +46,10 @@ X11-демон, evdev-capture и конфиг; Wayland-инъекция ещё �
 - подавление собственных XTest-событий по журналу инъектора;
 - профили по `WM_CLASS` (терминалы — `manual`, KeePass — `off`);
 - глобальные хоткеи undo/fix/pause из конфига; на X11 — с `XGrabKey`;
-- на Wayland — startup-запрос XTest-разрешения одним Shift-tap.
+- на Wayland — startup-запрос XTest-разрешения одним Shift-tap;
+- KDE: переключение раскладки через D-Bus + XKB-синхронизация;
+- звуковой индикатор смены раскладки (`sound_on_layout_change`);
+- разделитель не удаляется, поэтому последний пробел больше не исчезает.
 
 `layoutpilot-config` — TOML-конфиг:
 
@@ -62,6 +65,12 @@ X11-демон, evdev-capture и конфиг; Wayland-инъекция ещё �
 - неблокирующее чтение в отдельном потоке на устройство;
 - evdev keycode → XKB keycode (`+8`);
 - hotplug пока не поддерживается.
+
+`layoutpilot-compositor` — раскладка на уровне композитора:
+
+- KDE Plasma D-Bus `org.kde.keyboard` / `org.kde.KeyboardLayouts`;
+- список раскладок и `setLayout` по коду `us`/`ru`;
+- синхронизация XKB-группы для XWayland-инъекции.
 
 `layoutpilot-x11` — первый платформенный срез:
 
@@ -127,6 +136,7 @@ crates/
   layoutpilot-core/      конвертация, сегментация, буфер, движок
   layoutpilot-dict/      FST-словари, биграммы, DictionaryDetector
   layoutpilot-x11/       XTest, XRecord, XKB state, фокус
+  layoutpilot-compositor/KDE D-Bus раскладки
   layoutpilot-config/    TOML, валидация, профили, порядок раскладок
   layoutpilot-capture/   evdev-захват клавиатур
   layoutpilot-daemon/    бинарник layoutpilot: capture → engine → inject

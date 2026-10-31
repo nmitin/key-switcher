@@ -13,10 +13,11 @@ use std::env;
 use std::error::Error;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use layoutpilot_capture::{EvdevCapture, EvdevKeyEvent};
+use layoutpilot_compositor::KdeLayouts;
 use layoutpilot_config::{CaptureBackend, Config, Hotkey, InjectBackend, LayoutBackend};
 use layoutpilot_core::{
     CorrectionManager, CorrectionPlan, InputContext, LayoutId, Profile, ProfileResolver,
@@ -101,6 +102,108 @@ const EVDEV_RIGHTALT: u16 = 100;
 const EVDEV_LEFTMETA: u16 = 125;
 const EVDEV_RIGHTMETA: u16 = 126;
 const EVDEV_CAPSLOCK: u16 = 58;
+
+#[derive(Debug)]
+struct SoundPlayer {
+    enabled: bool,
+    failed: bool,
+}
+
+impl SoundPlayer {
+    const fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            failed: false,
+        }
+    }
+
+    fn play(&mut self) {
+        if !self.enabled || self.failed {
+            return;
+        }
+        if self.spawn("canberra-gtk-play", &["--id=bell"]) {
+            return;
+        }
+        if self.spawn("paplay", &["/usr/share/sounds/freedesktop/stereo/bell.oga"]) {
+            return;
+        }
+        self.failed = true;
+        eprintln!("layoutpilot: sound player unavailable; disabling layout sound");
+    }
+
+    fn spawn(&self, program: &str, args: &[&str]) -> bool {
+        let mut command = ProcessCommand::new(program);
+        command
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        match command.spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
+enum LayoutController {
+    X11(X11LayoutState),
+    Kde {
+        kde: KdeLayouts,
+        xkb: Option<X11LayoutState>,
+    },
+}
+
+impl LayoutController {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::X11(_) => "x11-xkb",
+            Self::Kde { .. } => "kde-dbus+xkb",
+        }
+    }
+
+    fn active_layout(&self) -> Result<Option<LayoutId>, Box<dyn Error>> {
+        match self {
+            Self::X11(state) => Ok(state.active_layout()?),
+            Self::Kde { kde, .. } => Ok(kde.current()?),
+        }
+    }
+
+    fn switch_to(&self, layout: LayoutId) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::X11(state) => {
+                state.switch_to(layout)?;
+            }
+            Self::Kde { kde, xkb } => {
+                kde.switch_to(layout)?;
+                if let Some(xkb) = xkb {
+                    if let Err(error) = xkb.switch_to(layout) {
+                        eprintln!("layoutpilot: cannot sync XKB group: {error}");
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn supports(&self, layout: LayoutId) -> bool {
+        match self {
+            Self::X11(state) => state.layouts().contains(&layout),
+            Self::Kde { kde, .. } => kde.supports(layout),
+        }
+    }
+
+    fn sync_xkb(&self, layout: LayoutId) {
+        if let Self::Kde { xkb: Some(xkb), .. } = self {
+            if let Err(error) = xkb.switch_to(layout) {
+                eprintln!("layoutpilot: cannot sync XKB group: {error}");
+            }
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 struct EvdevModifiers {
@@ -201,7 +304,8 @@ struct Daemon {
     config: Config,
     capture: Capture,
     injector: X11Injector,
-    layouts: X11LayoutState,
+    layouts: LayoutController,
+    sound: SoundPlayer,
     focus: X11Focus,
     manager: CorrectionManager<DictionaryDetector>,
     resolver: ProfileResolver,
@@ -234,13 +338,10 @@ impl Daemon {
             }
         }
         let capture = open_capture(&config)?;
-        let layout_order = config.layout_order();
-        let layouts = match config.layout.backend {
-            LayoutBackend::Auto | LayoutBackend::X11 => X11LayoutState::new(layout_order)?,
-            other => return Err(format!("layout backend {other:?} is not wired yet").into()),
-        };
+        let layouts = open_layouts(&config)?;
         let focus = X11Focus::new()?;
         let active_layout = layouts.active_layout().ok().flatten();
+        let sound = SoundPlayer::new(config.general.sound_on_layout_change);
         let hotkeys = Hotkeys::from_config(&config)?;
         let (hotkey_grabber, grabbed_hotkeys) = setup_hotkey_grabber(&hotkeys);
         let resolver = config.to_profile_resolver();
@@ -259,6 +360,7 @@ impl Daemon {
             capture,
             injector,
             layouts,
+            sound,
             focus,
             resolver,
             active_layout,
@@ -280,11 +382,12 @@ impl Daemon {
 
     fn run(mut self) -> Result<(), Box<dyn Error>> {
         println!(
-            "layoutpilot: capture={} ({}), dry_run={}, layout={:?}, app={:?}",
+            "layoutpilot: capture={} ({}), layout={} ({:?}), dry_run={}, app={:?}",
             self.capture.backend_name(),
             config_backend_name(self.config.capture.backend),
-            self.dry_run,
+            self.layouts.name(),
             self.active_layout,
+            self.dry_run,
             self.app_id
         );
         loop {
@@ -498,7 +601,7 @@ impl Daemon {
             self.manager.reset(ResetReason::Manual);
             return Ok(());
         }
-        if !self.layouts.layouts().contains(&plan.layout) {
+        if !self.layouts.supports(plan.layout) {
             eprintln!(
                 "layoutpilot: skip plan, layout {} is not configured",
                 plan.layout
@@ -507,10 +610,14 @@ impl Daemon {
             return Ok(());
         }
 
+        let previous_layout = self.active_layout;
         self.injector.tap_backspace(plan.backspaces)?;
         self.layouts.switch_to(plan.layout)?;
         self.injector.tap_text(&plan.text, plan.layout.table())?;
         self.active_layout = Some(plan.layout);
+        if previous_layout != Some(plan.layout) {
+            self.sound.play();
+        }
 
         self.ignore.extend(self.injector.take_sent_events());
         self.ignore_until = Instant::now() + IGNORE_WINDOW;
@@ -536,7 +643,13 @@ impl Daemon {
     fn refresh_layout(&mut self) {
         let active = self.layouts.active_layout().ok().flatten();
         if active != self.active_layout {
+            if self.active_layout.is_some() && active.is_some() {
+                self.sound.play();
+            }
             self.active_layout = active;
+            if let Some(active) = active {
+                self.layouts.sync_xkb(active);
+            }
             println!("layoutpilot: active layout → {active:?}");
             self.manager.reset(ResetReason::LayoutChange);
         }
@@ -617,6 +730,53 @@ fn setup_hotkey_grabber(hotkeys: &Hotkeys) -> (Option<X11HotkeyGrabber>, HashSet
         grabbed.len()
     );
     (Some(grabber), grabbed)
+}
+
+fn is_kde_session() -> bool {
+    env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_ascii_uppercase()
+        .contains("KDE")
+        || env::var_os("KDE_FULL_SESSION").is_some()
+}
+
+fn open_layouts(config: &Config) -> Result<LayoutController, Box<dyn Error>> {
+    let requested = config.layout.backend;
+    let backend = match requested {
+        LayoutBackend::Auto if is_kde_session() => LayoutBackend::Kde,
+        LayoutBackend::Auto => LayoutBackend::X11,
+        backend => backend,
+    };
+    match backend {
+        LayoutBackend::Kde => match KdeLayouts::new() {
+            Ok(kde) => {
+                let xkb = match X11LayoutState::new(config.layout_order()) {
+                    Ok(xkb) => Some(xkb),
+                    Err(error) => {
+                        eprintln!("layoutpilot: XKB sync unavailable: {error}");
+                        None
+                    }
+                };
+                if let Some(current) = kde.current().ok().flatten() {
+                    if let Some(xkb) = &xkb {
+                        let _ = xkb.switch_to(current);
+                    }
+                }
+                Ok(LayoutController::Kde { kde, xkb })
+            }
+            Err(error) if requested == LayoutBackend::Auto => {
+                eprintln!("layoutpilot: KDE layout backend unavailable ({error}); using XKB");
+                Ok(LayoutController::X11(X11LayoutState::new(
+                    config.layout_order(),
+                )?))
+            }
+            Err(error) => Err(error.into()),
+        },
+        LayoutBackend::X11 => Ok(LayoutController::X11(X11LayoutState::new(
+            config.layout_order(),
+        )?)),
+        other => Err(format!("layout backend {other:?} is not wired yet").into()),
+    }
 }
 
 fn open_capture(config: &Config) -> Result<Capture, Box<dyn Error>> {
@@ -711,6 +871,28 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
         Err(error) => {
             failures += 1;
             println!("XKB: FAIL ({error})");
+        }
+    }
+
+    if is_kde_session() {
+        match KdeLayouts::new() {
+            Ok(kde) => match kde.current() {
+                Ok(current) => println!(
+                    "KDE layouts: ok (current={current:?}, list={:?})",
+                    kde.layouts()
+                        .iter()
+                        .map(|layout| (&layout.code, layout.id))
+                        .collect::<Vec<_>>()
+                ),
+                Err(error) => {
+                    failures += 1;
+                    println!("KDE layouts: FAIL ({error})");
+                }
+            },
+            Err(error) => {
+                failures += 1;
+                println!("KDE layouts: FAIL ({error})");
+            }
         }
     }
 

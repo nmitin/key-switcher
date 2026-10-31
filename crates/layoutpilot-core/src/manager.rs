@@ -31,7 +31,9 @@ pub struct CorrectionPlan {
     pub layout: LayoutId,
     /// Number of Backspace presses before typing.
     pub backspaces: usize,
-    /// Text to type after the backspaces (including the separator).
+    /// Text to type after the backspaces. The separator that triggered the
+    /// correction is deliberately not included: it is already in the
+    /// application and must survive the replacement.
     pub text: String,
 }
 
@@ -99,8 +101,8 @@ impl<D: Detector> CorrectionManager<D> {
         let plan = CorrectionPlan {
             kind: PlanKind::Replace,
             layout: target,
-            backspaces: correction.delete_chars(false),
-            text: text_with(&correction.converted, correction.separator),
+            backspaces: correction.word_chars,
+            text: correction.converted.clone(),
         };
         self.last = Some(LastDirection {
             source,
@@ -147,8 +149,8 @@ impl<D: Detector> CorrectionManager<D> {
                 let plan = CorrectionPlan {
                     kind: PlanKind::Replace,
                     layout: target,
-                    backspaces: correction.delete_chars(correction.separator.is_some()),
-                    text: text_with(&correction.converted, correction.separator),
+                    backspaces: correction.word_chars,
+                    text: correction.converted.clone(),
                 };
                 self.last = Some(LastDirection {
                     source,
@@ -162,8 +164,8 @@ impl<D: Detector> CorrectionManager<D> {
                 Some(CorrectionPlan {
                     kind: PlanKind::Undo,
                     layout: last.source,
-                    backspaces: correction.delete_chars(correction.separator.is_some()),
-                    text: text_with(&correction.original, correction.separator),
+                    backspaces: correction.word_chars,
+                    text: correction.original,
                 })
             }
             Action::Redo(correction) => {
@@ -171,20 +173,12 @@ impl<D: Detector> CorrectionManager<D> {
                 Some(CorrectionPlan {
                     kind: PlanKind::Redo,
                     layout: last.target,
-                    backspaces: correction.delete_chars(correction.separator.is_some()),
-                    text: text_with(&correction.converted, correction.separator),
+                    backspaces: correction.word_chars,
+                    text: correction.converted,
                 })
             }
         }
     }
-}
-
-fn text_with(word: &str, separator: Option<char>) -> String {
-    let mut text = word.to_owned();
-    if let Some(separator) = separator {
-        text.push(separator);
-    }
-    text
 }
 
 #[cfg(test)]
@@ -227,8 +221,8 @@ mod tests {
         .expect("plan");
         assert_eq!(plan.kind, PlanKind::Replace);
         assert_eq!(plan.layout, LayoutId::Ru);
-        assert_eq!(plan.backspaces, 7);
-        assert_eq!(plan.text, "привет ");
+        assert_eq!(plan.backspaces, 6);
+        assert_eq!(plan.text, "привет");
         assert!(plan.is_typeable());
     }
 
@@ -241,14 +235,14 @@ mod tests {
         let undo = manager.undo().expect("undo");
         assert_eq!(undo.kind, PlanKind::Undo);
         assert_eq!(undo.layout, LayoutId::Us);
-        assert_eq!(undo.backspaces, 7);
-        assert_eq!(undo.text, "ghbdtn ");
+        assert_eq!(undo.backspaces, 6);
+        assert_eq!(undo.text, "ghbdtn");
 
         let redo = manager.undo().expect("redo");
         assert_eq!(redo.kind, PlanKind::Redo);
         assert_eq!(redo.layout, LayoutId::Ru);
-        assert_eq!(redo.backspaces, 7);
-        assert_eq!(redo.text, "привет ");
+        assert_eq!(redo.backspaces, 6);
+        assert_eq!(redo.text, "привет");
     }
 
     #[test]

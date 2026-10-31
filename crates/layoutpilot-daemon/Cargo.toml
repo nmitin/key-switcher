@@ -8,6 +8,7 @@ description = "X11 daemon that connects capture, correction engine and injection
 
 [dependencies]
 layoutpilot-core = { path = "../layoutpilot-core" }
+layoutpilot-compositor = { path = "../layoutpilot-compositor" }
 layoutpilot-config = { path = "../layoutpilot-config" }
 layoutpilot-capture = { path = "../layoutpilot-capture" }
 layoutpilot-dict = { path = "../layoutpilot-dict" }

@@ -204,6 +204,8 @@ pub struct GeneralConfig {
     pub fix_hotkey: String,
     /// Pause hotkey string (not wired yet).
     pub pause_hotkey: String,
+    /// Play a short sound when the active layout changes.
+    pub sound_on_layout_change: bool,
 }
 
 impl Default for GeneralConfig {
@@ -217,6 +219,7 @@ impl Default for GeneralConfig {
             undo_hotkey: "Pause".to_owned(),
             fix_hotkey: "Ctrl+Shift+F".to_owned(),
             pause_hotkey: "Ctrl+Shift+P".to_owned(),
+            sound_on_layout_change: true,
         }
     }
 }
@@ -570,6 +573,7 @@ mod tests {
         assert_eq!(config.capture.backend, CaptureBackend::Auto);
         assert_eq!(config.inject.backend, InjectBackend::Auto);
         assert!(config.inject.request_permission_on_start);
+        assert!(config.general.sound_on_layout_change);
         assert_eq!(config.layout.backend, LayoutBackend::Auto);
         assert_eq!(config.layout.order, vec![LayoutCode::Us, LayoutCode::Ru]);
         assert!(!config.privacy.store_keystrokes);
