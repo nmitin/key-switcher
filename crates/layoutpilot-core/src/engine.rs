@@ -302,6 +302,12 @@ impl<D: Detector> Engine<D> {
         self.undo.is_some()
     }
 
+    /// Whether the last correction is currently applied (undo would revert it).
+    #[must_use]
+    pub fn undo_applied(&self) -> bool {
+        self.undo.as_ref().is_some_and(|record| record.applied)
+    }
+
     /// Last reason the engine dropped its context.
     #[must_use]
     pub const fn last_reset(&self) -> Option<ResetReason> {
@@ -346,12 +352,15 @@ impl<D: Detector> Engine<D> {
             return None;
         }
 
-        // Punctuation can be a real letter in the other layout (`.` → `ю`,
-        // `[` → `х`). Keep it inside the word; trailing sentence punctuation
-        // is split off later and preserved.
-        if self.config.punct_trigger
-            && !self.current_word.is_empty()
-            && punctuation_is_letter(ch, context.active_layout)
+        // Punctuation is kept inside the word when it can be a letter in the
+        // other layout, when punctuation triggers are disabled, or when Shift
+        // is held (injecting during Shift would uppercase the replacement).
+        // Trailing sentence punctuation is split off later and preserved.
+        if !self.current_word.is_empty()
+            && is_punctuation(ch)
+            && (!self.config.punct_trigger
+                || context.modifiers.shift
+                || punctuation_is_letter(ch, context.active_layout))
         {
             self.current_word.push(ch);
             self.buffer.push(ch);
@@ -493,6 +502,7 @@ impl<D: Detector> Engine<D> {
             || (ch == '\t'
                 && profile == Profile::Aggressive
                 && self.config.tab_trigger_in_aggressive)
+            || (ch == '\n' && self.config.enter_trigger)
     }
 
     fn finish_token(&mut self, ch: char) {
@@ -560,6 +570,10 @@ impl<D: Detector> Engine<D> {
     }
 }
 
+fn is_punctuation(ch: char) -> bool {
+    !ch.is_alphanumeric() && !ch.is_whitespace() && !is_word_char(ch)
+}
+
 fn punctuation_is_letter(ch: char, layout: LayoutId) -> bool {
     layout
         .table()
@@ -600,7 +614,6 @@ mod tests {
             "мир",
             "vbh",
             "hello",
-            "руддщ",
             "салют",
             "смех",
         ])
@@ -785,6 +798,56 @@ mod tests {
 
         let mut engine = Engine::new(EngineConfig::default(), detector());
         assert_eq!(type_text(&mut engine, "/usr/ghbdtn ", &auto()), None);
+    }
+
+    #[test]
+    fn enter_is_a_trigger_when_enabled() {
+        let config = EngineConfig {
+            enter_trigger: true,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config, detector());
+        let correction = replace(type_text(&mut engine, "ghbdtn\n", &auto()));
+        assert_eq!(correction.separator, Some('\n'));
+        assert_eq!(correction.converted, "привет");
+    }
+
+    #[test]
+    fn punctuation_stays_in_word_when_triggers_disabled() {
+        let config = EngineConfig {
+            punct_trigger: false,
+            ..EngineConfig::default()
+        };
+        let context = InputContext::new(Profile::Auto, LayoutId::Ru);
+        let mut engine = Engine::new(config, detector());
+        assert_eq!(type_text(&mut engine, "руддщ!", &context), None);
+        let correction = replace(engine.on_char(' ', &context));
+        assert_eq!(correction.original, "руддщ!");
+        assert_eq!(correction.converted, "hello!");
+    }
+
+    #[test]
+    fn shifted_punctuation_is_deferred() {
+        let context = InputContext::new(Profile::Auto, LayoutId::Ru);
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "руддщ", &context);
+        let shift = context.with_modifiers(Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        });
+        assert_eq!(engine.on_char('!', &shift), None);
+        let correction = replace(engine.on_char(' ', &context));
+        assert_eq!(correction.converted, "hello!");
+    }
+
+    #[test]
+    fn backspace_undo_state_is_exposed() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        assert!(!engine.undo_applied());
+        type_text(&mut engine, "ghbdtn ", &auto());
+        assert!(engine.undo_applied());
+        let _ = engine.undo();
+        assert!(!engine.undo_applied());
     }
 
     #[test]

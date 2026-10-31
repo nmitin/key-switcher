@@ -4,7 +4,7 @@
 [general]
 enabled = true
 languages = ["ru", "en"]
-triggers = ["space", "punct"]      # space | punct | tab; enter is never a trigger
+triggers = ["space", "enter"]      # space | punct | tab | enter
 min_word_len = 3
 confidence_threshold = 0.97
 undo_hotkey = "Pause"
@@ -12,6 +12,7 @@ fix_hotkey = "Ctrl+Shift+F"
 pause_hotkey = "Ctrl+Shift+P"
 sound_on_layout_change = true       # звук при смене раскладки
 sound_file = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
+backspace_undo = true
 
 [capture]
 backend = "auto"                   # auto | evdev | xrecord | portal | ime

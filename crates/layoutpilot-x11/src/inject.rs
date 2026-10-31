@@ -10,6 +10,10 @@ use crate::error::X11Error;
 
 /// Standard evdev keycode for Backspace.
 pub const BACKSPACE_KEYCODE: u8 = 22;
+/// Standard evdev keycode for Return.
+pub const RETURN_KEYCODE: u8 = 36;
+/// Standard evdev keycode for Tab.
+pub const TAB_KEYCODE: u8 = 23;
 /// Standard evdev keycode for Shift.
 pub const SHIFT_KEYCODE: u8 = 50;
 
@@ -65,6 +69,14 @@ impl X11Injector {
         // character cannot leave a partially queued replacement.
         let mut keycodes = Vec::with_capacity(text.chars().count());
         for ch in text.chars() {
+            if ch == '\n' {
+                keycodes.push((RETURN_KEYCODE, false));
+                continue;
+            }
+            if ch == '\t' {
+                keycodes.push((TAB_KEYCODE, false));
+                continue;
+            }
             let keystroke = layout
                 .keystroke_for(ch)
                 .ok_or(X11Error::UnsupportedChar(ch))?;

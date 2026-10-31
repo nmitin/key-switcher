@@ -123,6 +123,8 @@ pub enum Trigger {
     Punct,
     /// Tab (aggressive only).
     Tab,
+    /// Enter.
+    Enter,
 }
 
 /// LLM mode.
@@ -208,6 +210,8 @@ pub struct GeneralConfig {
     pub sound_on_layout_change: bool,
     /// Sound file played on layout change.
     pub sound_file: String,
+    /// Treat Backspace after a correction as undo.
+    pub backspace_undo: bool,
 }
 
 impl Default for GeneralConfig {
@@ -215,7 +219,7 @@ impl Default for GeneralConfig {
         Self {
             enabled: true,
             languages: vec!["ru".to_owned(), "en".to_owned()],
-            triggers: vec![Trigger::Space, Trigger::Punct],
+            triggers: vec![Trigger::Space, Trigger::Enter],
             min_word_len: 3,
             confidence_threshold: 0.97,
             undo_hotkey: "Pause".to_owned(),
@@ -223,6 +227,7 @@ impl Default for GeneralConfig {
             pause_hotkey: "Ctrl+Shift+P".to_owned(),
             sound_on_layout_change: true,
             sound_file: "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga".to_owned(),
+            backspace_undo: true,
         }
     }
 }
@@ -532,6 +537,7 @@ impl Config {
             tab_trigger_in_aggressive: self.general.triggers.contains(&Trigger::Tab),
             space_trigger: self.general.triggers.contains(&Trigger::Space),
             punct_trigger: self.general.triggers.contains(&Trigger::Punct),
+            enter_trigger: self.general.triggers.contains(&Trigger::Enter),
             ..EngineConfig::default()
         }
     }
@@ -571,6 +577,10 @@ mod tests {
         let config = Config::default();
         assert!(config.general.enabled);
         assert_eq!(config.general.languages, vec!["ru", "en"]);
+        assert_eq!(
+            config.general.triggers,
+            vec![Trigger::Space, Trigger::Enter]
+        );
         assert_eq!(config.general.min_word_len, 3);
         assert!((config.general.confidence_threshold - 0.97).abs() < f32::EPSILON);
         assert_eq!(config.capture.backend, CaptureBackend::Auto);
@@ -578,6 +588,7 @@ mod tests {
         assert!(config.inject.request_permission_on_start);
         assert!(config.general.sound_on_layout_change);
         assert!(config.general.sound_file.contains("camera-shutter"));
+        assert!(config.general.backspace_undo);
         assert_eq!(config.layout.backend, LayoutBackend::Auto);
         assert_eq!(config.layout.order, vec![LayoutCode::Us, LayoutCode::Ru]);
         assert!(!config.privacy.store_keystrokes);

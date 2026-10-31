@@ -37,6 +37,10 @@ pub struct CorrectionPlan {
     pub separator: Option<char>,
 }
 
+fn is_control_separator(ch: char) -> bool {
+    matches!(ch, '\n' | '\t')
+}
+
 impl CorrectionPlan {
     /// Whether every character of the plan can be typed in its layout.
     #[must_use]
@@ -44,7 +48,7 @@ impl CorrectionPlan {
         self.text
             .chars()
             .chain(self.separator)
-            .all(|ch| self.layout.table().keystroke_for(ch).is_some())
+            .all(|ch| is_control_separator(ch) || self.layout.table().keystroke_for(ch).is_some())
     }
 }
 
@@ -112,6 +116,13 @@ impl<D: Detector> CorrectionManager<D> {
             correction,
         });
         Some(plan)
+    }
+
+    /// Undo or redo the last correction.
+    /// Whether the last correction is currently applied.
+    #[must_use]
+    pub fn undo_applied(&self) -> bool {
+        self.engine.undo_applied()
     }
 
     /// Undo or redo the last correction.
@@ -251,6 +262,34 @@ mod tests {
         assert_eq!(redo.backspaces, 7);
         assert_eq!(redo.text, "привет");
         assert_eq!(redo.separator, Some(' '));
+    }
+
+    #[test]
+    fn enter_plan_uses_newline_separator() {
+        let config = crate::profile::EngineConfig {
+            enter_trigger: true,
+            ..crate::profile::EngineConfig::default()
+        };
+        let mut manager = CorrectionManager::new(config, StaticDetector::new(1.0));
+        let context = context(Profile::Auto, LayoutId::Us);
+        let plan = type_text(&mut manager, "ghbdtn\n", &context).expect("plan");
+        assert_eq!(plan.kind, PlanKind::Replace);
+        assert_eq!(plan.layout, LayoutId::Ru);
+        assert_eq!(plan.backspaces, 7);
+        assert_eq!(plan.text, "привет");
+        assert_eq!(plan.separator, Some('\n'));
+        assert!(plan.is_typeable());
+    }
+
+    #[test]
+    fn undo_applied_state_tracks_correction() {
+        let mut manager = manager();
+        let context = context(Profile::Auto, LayoutId::Us);
+        assert!(!manager.undo_applied());
+        type_text(&mut manager, "ghbdtn ", &context);
+        assert!(manager.undo_applied());
+        let _ = manager.undo();
+        assert!(!manager.undo_applied());
     }
 
     #[test]

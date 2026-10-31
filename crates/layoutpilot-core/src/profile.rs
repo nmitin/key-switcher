@@ -51,6 +51,8 @@ pub struct EngineConfig {
     pub space_trigger: bool,
     /// Whether closing punctuation is a correction trigger.
     pub punct_trigger: bool,
+    /// Whether Enter is a correction trigger.
+    pub enter_trigger: bool,
     /// Character buffer capacity (default 256).
     pub buffer_capacity: usize,
     /// Whether corrections can be undone.
@@ -69,6 +71,7 @@ impl Default for EngineConfig {
             tab_trigger_in_aggressive: false,
             space_trigger: true,
             punct_trigger: true,
+            enter_trigger: false,
             buffer_capacity: 256,
             undo_enabled: true,
         }

@@ -488,6 +488,12 @@ impl Daemon {
 
         match event.keycode {
             BACKSPACE_KEYCODE => {
+                if self.config.general.backspace_undo && self.manager.undo_applied() {
+                    if let Some(plan) = self.manager.undo() {
+                        self.apply(plan)?;
+                        return Ok(());
+                    }
+                }
                 self.manager.on_backspace();
                 return Ok(());
             }
@@ -864,6 +870,17 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
         "hotkeys: undo={:?}, fix={:?}, pause={:?}",
         config.general.undo_hotkey, config.general.fix_hotkey, config.general.pause_hotkey
     );
+    println!(
+        "triggers: {:?}, backspace_undo={}, sound={}{}",
+        config.general.triggers,
+        config.general.backspace_undo,
+        config.general.sound_on_layout_change,
+        if config.general.sound_on_layout_change {
+            format!(" ({})", config.general.sound_file)
+        } else {
+            String::new()
+        }
+    );
 
     match X11HotkeyGrabber::new() {
         Ok(mut grabber) => {
@@ -1095,6 +1112,24 @@ mod tests {
             Some(HotkeyAction::Pause)
         );
         assert_eq!(hotkeys.action(41, 0), None);
+    }
+
+    #[test]
+    fn default_config_keeps_punctuation_and_lowercase() {
+        let config = Config::default();
+        let mut manager =
+            CorrectionManager::new(config.to_engine_config(), DictionaryDetector::new());
+        let context = InputContext::new(Profile::Auto, LayoutId::Ru);
+        let mut plan = None;
+        for ch in "руддщ! ".chars() {
+            if let Some(next) = manager.on_char(ch, &context) {
+                plan = Some(next);
+            }
+        }
+        let plan = plan.expect("plan");
+        assert_eq!(plan.text, "hello!");
+        assert_eq!(plan.separator, Some(' '));
+        assert_eq!(plan.backspaces, 7);
     }
 
     #[test]
