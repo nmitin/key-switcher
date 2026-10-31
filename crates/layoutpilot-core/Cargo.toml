@@ -1,0 +1,16 @@
+[package]
+name = "layoutpilot-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Platform-independent conversion, segmentation and buffer core for LayoutPilot"
+
+[dependencies]
+layoutpilot-layouts = { path = "../layoutpilot-layouts" }
+
+[dev-dependencies]
+proptest = "=1.6.0"
+
+[lints]
+workspace = true

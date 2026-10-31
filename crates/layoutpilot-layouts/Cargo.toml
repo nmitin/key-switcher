@@ -1,0 +1,12 @@
+[package]
+name = "layoutpilot-layouts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "XKB-derived layout tables and physical-key mappings for LayoutPilot"
+
+[dependencies]
+
+[lints]
+workspace = true

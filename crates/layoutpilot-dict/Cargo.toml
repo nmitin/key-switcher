@@ -1,0 +1,18 @@
+[package]
+name = "layoutpilot-dict"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license = "(MIT OR Apache-2.0) AND CC-BY-SA-4.0"
+publish = false
+description = "Frequency dictionaries and a scored Detector for LayoutPilot"
+
+[dependencies]
+layoutpilot-core = { path = "../layoutpilot-core" }
+fst = "0.4"
+
+[build-dependencies]
+fst = "0.4"
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/layoutpilot-layouts",
+    "crates/layoutpilot-core",
+    "crates/layoutpilot-dict",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+authors = ["LayoutPilot contributors"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"

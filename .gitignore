@@ -1,0 +1,5 @@
+/target/
+/.toolchain/
+/rustup-init.sh
+*.swp
+.DS_Store
