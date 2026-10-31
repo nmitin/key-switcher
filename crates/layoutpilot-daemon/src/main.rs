@@ -537,6 +537,7 @@ impl Daemon {
         let active = self.layouts.active_layout().ok().flatten();
         if active != self.active_layout {
             self.active_layout = active;
+            println!("layoutpilot: active layout → {active:?}");
             self.manager.reset(ResetReason::LayoutChange);
         }
     }
@@ -554,8 +555,14 @@ impl Daemon {
                 self.window = Some(info.window);
                 self.app_id = info.app_id;
                 self.profile = self.resolver.resolve(self.app_id.as_deref().unwrap_or(""));
-                if (window_changed || app_changed) && self.clear_on_focus_change {
-                    self.manager.reset(ResetReason::FocusChange);
+                if window_changed || app_changed {
+                    println!(
+                        "layoutpilot: focus window={:#x}, app={:?}, profile={:?}",
+                        info.window, self.app_id, self.profile
+                    );
+                    if self.clear_on_focus_change {
+                        self.manager.reset(ResetReason::FocusChange);
+                    }
                 }
             }
             Err(_) => {
