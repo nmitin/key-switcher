@@ -14,6 +14,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use layoutpilot_core::{AppRule, EngineConfig, LayoutId, Profile, ProfileResolver};
+
+pub mod hotkey;
+
+pub use hotkey::{Hotkey, HotkeyError};
 use serde::{Deserialize, Serialize};
 
 /// Result type for configuration operations.
@@ -484,6 +488,17 @@ impl Config {
                 "apps patterns must not be empty".to_owned(),
             ));
         }
+        for (name, value) in [
+            ("general.undo_hotkey", &self.general.undo_hotkey),
+            ("general.fix_hotkey", &self.general.fix_hotkey),
+            ("general.pause_hotkey", &self.general.pause_hotkey),
+        ] {
+            if value.trim().is_empty() {
+                continue;
+            }
+            Hotkey::parse(value)
+                .map_err(|error| ConfigError::Validation(format!("{name} is invalid: {error}")))?;
+        }
         Ok(())
     }
 
@@ -647,6 +662,17 @@ future_option = true
         if let Some(path) = Config::default_path() {
             assert!(path.ends_with("layoutpilot/config.toml"));
         }
+    }
+
+    #[test]
+    fn rejects_invalid_hotkeys() {
+        let mut config = Config::default();
+        config.general.fix_hotkey = "Ctrl+NoSuchKey".to_owned();
+        assert!(config.validate().is_err());
+
+        config.general.fix_hotkey = "Ctrl+Shift+F".to_owned();
+        config.general.undo_hotkey.clear();
+        assert!(config.validate().is_ok());
     }
 
     #[test]

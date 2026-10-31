@@ -56,6 +56,19 @@ mode = "auto"
 `*terminal*`, `*konsole*`, `*alacritty*`, `*kitty*` по умолчанию `manual`,
 `*keepass*` — `off`.
 
+## Хоткеи
+
+```toml
+undo_hotkey = "Pause"
+fix_hotkey = "Ctrl+Shift+F"
+pause_hotkey = "Ctrl+Shift+P"
+```
+
+Формат: `Ctrl`/`Control`, `Alt`, `Shift`, `Super`/`Meta` + клавиша.
+Клавиша — один печатный символ, `Pause`, `Escape`, `Space`, `Tab`, `Enter`,
+`Backspace` или `F1`–`F12`. Пустая строка отключает хоткей. Невалидная строка
+отвергается при загрузке конфига.
+
 ## Backend'ы
 
 - `capture = "auto"` выбирает `xrecord`, если задан `DISPLAY`, иначе `evdev`.
@@ -82,3 +95,4 @@ mode = "auto"
 - `learning`, LLM-поля и хоткеи пока только читаются/валидируются; поведение
   для них появится на следующих этапах.
 - `history_size` не создаёт историю: в v1 история не хранится.
+- Хоткеи пока пассивные: демон видит нажатие, но не забирает его у приложения.

@@ -16,7 +16,7 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use layoutpilot_capture::{EvdevCapture, EvdevKeyEvent};
-use layoutpilot_config::{CaptureBackend, Config, InjectBackend, LayoutBackend};
+use layoutpilot_config::{CaptureBackend, Config, Hotkey, InjectBackend, LayoutBackend};
 use layoutpilot_core::{
     CorrectionManager, CorrectionPlan, InputContext, LayoutId, Profile, ProfileResolver,
     ResetReason,
@@ -31,6 +31,58 @@ const RETURN_KEYCODE: u8 = 36;
 const TAB_KEYCODE: u8 = 23;
 const ESCAPE_KEYCODE: u8 = 9;
 const IGNORE_WINDOW: Duration = Duration::from_millis(750);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HotkeyAction {
+    Undo,
+    Fix,
+    Pause,
+}
+
+#[derive(Debug)]
+struct Hotkeys {
+    undo: Option<Hotkey>,
+    fix: Option<Hotkey>,
+    pause: Option<Hotkey>,
+}
+
+impl Hotkeys {
+    fn from_config(config: &Config) -> Result<Self, Box<dyn Error>> {
+        fn parse(value: &str) -> Result<Option<Hotkey>, Box<dyn Error>> {
+            if value.trim().is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(Hotkey::parse(value)?))
+            }
+        }
+        Ok(Self {
+            undo: parse(&config.general.undo_hotkey)?,
+            fix: parse(&config.general.fix_hotkey)?,
+            pause: parse(&config.general.pause_hotkey)?,
+        })
+    }
+
+    fn action(&self, keycode: u16, state: u16) -> Option<HotkeyAction> {
+        if self
+            .pause
+            .is_some_and(|hotkey| hotkey.matches(keycode, state))
+        {
+            Some(HotkeyAction::Pause)
+        } else if self
+            .undo
+            .is_some_and(|hotkey| hotkey.matches(keycode, state))
+        {
+            Some(HotkeyAction::Undo)
+        } else if self
+            .fix
+            .is_some_and(|hotkey| hotkey.matches(keycode, state))
+        {
+            Some(HotkeyAction::Fix)
+        } else {
+            None
+        }
+    }
+}
 
 const SHIFT_MASK: u16 = 1;
 const LOCK_MASK: u16 = 2;
@@ -151,6 +203,8 @@ struct Daemon {
     focus: X11Focus,
     manager: CorrectionManager<DictionaryDetector>,
     resolver: ProfileResolver,
+    hotkeys: Hotkeys,
+    paused: bool,
     active_layout: Option<LayoutId>,
     profile: Profile,
     app_id: Option<String>,
@@ -176,6 +230,7 @@ impl Daemon {
         };
         let focus = X11Focus::new()?;
         let active_layout = layouts.active_layout().ok().flatten();
+        let hotkeys = Hotkeys::from_config(&config)?;
         let resolver = config.to_profile_resolver();
         let profile = resolver.resolve("");
         let idle_timeout = Duration::from_millis(config.privacy.buffer_idle_timeout_ms.max(1));
@@ -183,6 +238,8 @@ impl Daemon {
 
         let mut daemon = Self {
             manager: CorrectionManager::new(config.to_engine_config(), DictionaryDetector::new()),
+            hotkeys,
+            paused: false,
             config,
             capture,
             injector,
@@ -282,6 +339,14 @@ impl Daemon {
         }
         self.last_input = Instant::now();
 
+        if let Some(action) = self.hotkeys.action(u16::from(event.keycode), event.state) {
+            self.handle_hotkey(action, &event)?;
+            return Ok(());
+        }
+        if self.paused {
+            return Ok(());
+        }
+
         match event.keycode {
             BACKSPACE_KEYCODE => {
                 self.manager.on_backspace();
@@ -309,6 +374,46 @@ impl Daemon {
             return Ok(());
         };
         self.handle_char(ch, &event)
+    }
+
+    fn handle_hotkey(
+        &mut self,
+        action: HotkeyAction,
+        event: &KeyEvent,
+    ) -> Result<(), Box<dyn Error>> {
+        match action {
+            HotkeyAction::Pause => {
+                self.paused = !self.paused;
+                if self.paused {
+                    self.manager.pause();
+                    println!("layoutpilot: paused");
+                } else {
+                    self.manager.resume();
+                    println!("layoutpilot: resumed");
+                }
+            }
+            HotkeyAction::Undo => {
+                if self.paused {
+                    return Ok(());
+                }
+                match self.manager.undo() {
+                    Some(plan) => self.apply(plan)?,
+                    None => println!("layoutpilot: undo unavailable"),
+                }
+            }
+            HotkeyAction::Fix => {
+                if self.paused {
+                    return Ok(());
+                }
+                let app_id = self.app_id.clone();
+                let context = self.context(event, app_id.as_deref());
+                match self.manager.on_fix_last_word(&context) {
+                    Some(plan) => self.apply(plan)?,
+                    None => println!("layoutpilot: no word to fix"),
+                }
+            }
+        }
+        Ok(())
     }
 
     fn handle_char(&mut self, ch: char, event: &KeyEvent) -> Result<(), Box<dyn Error>> {
@@ -474,6 +579,11 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
     println!(
         "backends: capture={:?}, inject={:?}, layout={:?}, order={:?}",
         config.capture.backend, config.inject.backend, config.layout.backend, config.layout.order
+    );
+
+    println!(
+        "hotkeys: undo={:?}, fix={:?}, pause={:?}",
+        config.general.undo_hotkey, config.general.fix_hotkey, config.general.pause_hotkey
     );
 
     match X11Injector::new() {
@@ -652,6 +762,27 @@ mod tests {
             resolver.resolve("org.gnome.TextEditor"),
             layoutpilot_core::Profile::Auto
         );
+    }
+
+    #[test]
+    fn default_hotkeys_are_parsed_and_matched() {
+        let hotkeys = Hotkeys::from_config(&Config::default()).unwrap();
+        assert_eq!(hotkeys.action(127, 0), Some(HotkeyAction::Undo));
+        assert_eq!(
+            hotkeys.action(
+                41,
+                layoutpilot_config::hotkey::MOD_CONTROL | layoutpilot_config::hotkey::MOD_SHIFT
+            ),
+            Some(HotkeyAction::Fix)
+        );
+        assert_eq!(
+            hotkeys.action(
+                33,
+                layoutpilot_config::hotkey::MOD_CONTROL | layoutpilot_config::hotkey::MOD_SHIFT
+            ),
+            Some(HotkeyAction::Pause)
+        );
+        assert_eq!(hotkeys.action(41, 0), None);
     }
 
     #[test]
