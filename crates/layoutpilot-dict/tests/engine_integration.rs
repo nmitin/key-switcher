@@ -48,8 +48,9 @@ fn manager_builds_a_real_correction_plan() {
     let plan = plan.expect("plan");
     assert_eq!(plan.kind, PlanKind::Replace);
     assert_eq!(plan.layout, LayoutId::Ru);
-    assert_eq!(plan.backspaces, 6);
+    assert_eq!(plan.backspaces, 7);
     assert_eq!(plan.text, "привет");
+    assert_eq!(plan.separator, Some(' '));
     assert!(plan.is_typeable());
 }
 

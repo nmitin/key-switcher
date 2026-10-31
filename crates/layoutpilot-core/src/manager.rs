@@ -31,10 +31,10 @@ pub struct CorrectionPlan {
     pub layout: LayoutId,
     /// Number of Backspace presses before typing.
     pub backspaces: usize,
-    /// Text to type after the backspaces. The separator that triggered the
-    /// correction is deliberately not included: it is already in the
-    /// application and must survive the replacement.
+    /// Text to type after the backspaces.
     pub text: String,
+    /// Separator to type after a short pause, if the correction consumed one.
+    pub separator: Option<char>,
 }
 
 impl CorrectionPlan {
@@ -43,6 +43,7 @@ impl CorrectionPlan {
     pub fn is_typeable(&self) -> bool {
         self.text
             .chars()
+            .chain(self.separator)
             .all(|ch| self.layout.table().keystroke_for(ch).is_some())
     }
 }
@@ -101,8 +102,9 @@ impl<D: Detector> CorrectionManager<D> {
         let plan = CorrectionPlan {
             kind: PlanKind::Replace,
             layout: target,
-            backspaces: correction.word_chars,
+            backspaces: correction.word_chars + usize::from(correction.separator.is_some()),
             text: correction.converted.clone(),
+            separator: correction.separator,
         };
         self.last = Some(LastDirection {
             source,
@@ -149,8 +151,9 @@ impl<D: Detector> CorrectionManager<D> {
                 let plan = CorrectionPlan {
                     kind: PlanKind::Replace,
                     layout: target,
-                    backspaces: correction.word_chars,
+                    backspaces: correction.word_chars + usize::from(correction.separator.is_some()),
                     text: correction.converted.clone(),
+                    separator: correction.separator,
                 };
                 self.last = Some(LastDirection {
                     source,
@@ -164,8 +167,9 @@ impl<D: Detector> CorrectionManager<D> {
                 Some(CorrectionPlan {
                     kind: PlanKind::Undo,
                     layout: last.source,
-                    backspaces: correction.word_chars,
+                    backspaces: correction.word_chars + usize::from(correction.separator.is_some()),
                     text: correction.original,
+                    separator: correction.separator,
                 })
             }
             Action::Redo(correction) => {
@@ -173,8 +177,9 @@ impl<D: Detector> CorrectionManager<D> {
                 Some(CorrectionPlan {
                     kind: PlanKind::Redo,
                     layout: last.target,
-                    backspaces: correction.word_chars,
+                    backspaces: correction.word_chars + usize::from(correction.separator.is_some()),
                     text: correction.converted,
+                    separator: correction.separator,
                 })
             }
         }
@@ -221,8 +226,9 @@ mod tests {
         .expect("plan");
         assert_eq!(plan.kind, PlanKind::Replace);
         assert_eq!(plan.layout, LayoutId::Ru);
-        assert_eq!(plan.backspaces, 6);
+        assert_eq!(plan.backspaces, 7);
         assert_eq!(plan.text, "привет");
+        assert_eq!(plan.separator, Some(' '));
         assert!(plan.is_typeable());
     }
 
@@ -235,14 +241,16 @@ mod tests {
         let undo = manager.undo().expect("undo");
         assert_eq!(undo.kind, PlanKind::Undo);
         assert_eq!(undo.layout, LayoutId::Us);
-        assert_eq!(undo.backspaces, 6);
+        assert_eq!(undo.backspaces, 7);
         assert_eq!(undo.text, "ghbdtn");
+        assert_eq!(undo.separator, Some(' '));
 
         let redo = manager.undo().expect("redo");
         assert_eq!(redo.kind, PlanKind::Redo);
         assert_eq!(redo.layout, LayoutId::Ru);
-        assert_eq!(redo.backspaces, 6);
+        assert_eq!(redo.backspaces, 7);
         assert_eq!(redo.text, "привет");
+        assert_eq!(redo.separator, Some(' '));
     }
 
     #[test]
@@ -255,6 +263,7 @@ mod tests {
         assert_eq!(plan.layout, LayoutId::Ru);
         assert_eq!(plan.backspaces, 6);
         assert_eq!(plan.text, "привет");
+        assert_eq!(plan.separator, None);
     }
 
     #[test]

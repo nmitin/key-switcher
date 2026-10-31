@@ -614,6 +614,14 @@ impl Daemon {
         self.injector.tap_backspace(plan.backspaces)?;
         self.layouts.switch_to(plan.layout)?;
         self.injector.tap_text(&plan.text, plan.layout.table())?;
+        if let Some(separator) = plan.separator {
+            // Give the application a moment to finish the replacement before
+            // sending the separator as a separate key event. This avoids the
+            // final space being lost in the same fast XTest batch.
+            std::thread::sleep(Duration::from_millis(2));
+            self.injector
+                .tap_text(&separator.to_string(), plan.layout.table())?;
+        }
         self.active_layout = Some(plan.layout);
         if previous_layout != Some(plan.layout) {
             self.sound.play();
