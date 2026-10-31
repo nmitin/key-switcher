@@ -158,8 +158,9 @@ cargo test --workspace
   `known_bias` предварительная (этап 3).
 - Есть X11-демон и evdev-capture, но нет Wayland-инъекции (EIS/virtual-keyboard).
   evdev на чистом Wayland без XWayland пока не даёт переключать раскладку.
-- XRecord видит только X11/XWayland-приложения; layout state пока опрашивается
-  по требованию, без `XkbStateNotify`.
+- XRecord видит только X11/XWayland-приложения. Проверено: XWayland-Kate
+  (`QT_QPA_PLATFORM=xcb kate`) корректируется, нативные Kate и Geany — нет.
+  Layout state пока опрашивается по требованию, без `XkbStateNotify`.
 - evdev перечисляет устройства один раз при старте: hotplug не реализован.
 - Порядок XKB-групп задаётся в конфиге, но автоопределение групп ещё не сделано.
 - При конфликте `XGrabKey` хоткей остаётся пассивным: приложение тоже получает
