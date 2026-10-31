@@ -47,6 +47,10 @@ pub struct EngineConfig {
     pub conservative_threshold: f32,
     /// Whether Tab triggers correction in the `aggressive` profile.
     pub tab_trigger_in_aggressive: bool,
+    /// Whether space is a correction trigger.
+    pub space_trigger: bool,
+    /// Whether closing punctuation is a correction trigger.
+    pub punct_trigger: bool,
     /// Character buffer capacity (default 256).
     pub buffer_capacity: usize,
     /// Whether corrections can be undone.
@@ -63,6 +67,8 @@ impl Default for EngineConfig {
             conservative_min_word_len: 4,
             conservative_threshold: 0.995,
             tab_trigger_in_aggressive: false,
+            space_trigger: true,
+            punct_trigger: true,
             buffer_capacity: 256,
             undo_enabled: true,
         }

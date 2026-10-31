@@ -4,22 +4,26 @@
 //! normalization → `CorrectionManager` (engine + dictionaries) → XTest
 //! injection with an XKB group switch.
 //!
-//! This is deliberately small: no config file, no tray, no global hotkeys yet.
-//! `--dry-run` prints the plan without injecting anything.
+//! The daemon loads `~/.config/layoutpilot/config.toml` (or `--config PATH`)
+//! and falls back to built-in defaults. Hot reload, global hotkeys, tray and
+//! evdev capture are not wired yet.
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::error::Error;
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
+use layoutpilot_capture::{EvdevCapture, EvdevKeyEvent};
+use layoutpilot_config::{CaptureBackend, Config, InjectBackend, LayoutBackend};
 use layoutpilot_core::{
-    AppRule, CorrectionManager, CorrectionPlan, EngineConfig, InputContext, LayoutId, Profile,
-    ProfileResolver, ResetReason,
+    CorrectionManager, CorrectionPlan, InputContext, LayoutId, Profile, ProfileResolver,
+    ResetReason,
 };
 use layoutpilot_dict::{DictionaryDetector, Language};
 use layoutpilot_x11::{
-    char_for, modifiers, KeyEvent, X11Error, X11Focus, X11Injector, X11LayoutState, XRecordCapture,
+    char_for, modifiers, KeyEvent, X11Focus, X11Injector, X11LayoutState, XRecordCapture,
 };
 
 const BACKSPACE_KEYCODE: u8 = 22;
@@ -28,8 +32,120 @@ const TAB_KEYCODE: u8 = 23;
 const ESCAPE_KEYCODE: u8 = 9;
 const IGNORE_WINDOW: Duration = Duration::from_millis(750);
 
+const SHIFT_MASK: u16 = 1;
+const LOCK_MASK: u16 = 2;
+const CONTROL_MASK: u16 = 4;
+const ALT_MASK: u16 = 8;
+const SUPER_MASK: u16 = 64;
+
+const EVDEV_LEFTSHIFT: u16 = 42;
+const EVDEV_RIGHTSHIFT: u16 = 54;
+const EVDEV_LEFTCTRL: u16 = 29;
+const EVDEV_RIGHTCTRL: u16 = 97;
+const EVDEV_LEFTALT: u16 = 56;
+const EVDEV_RIGHTALT: u16 = 100;
+const EVDEV_LEFTMETA: u16 = 125;
+const EVDEV_RIGHTMETA: u16 = 126;
+const EVDEV_CAPSLOCK: u16 = 58;
+
+#[derive(Debug, Default)]
+struct EvdevModifiers {
+    pressed: HashSet<u16>,
+    caps_lock: bool,
+}
+
+impl EvdevModifiers {
+    fn update(&mut self, evdev_keycode: u16, value: i32) -> bool {
+        if evdev_keycode == EVDEV_CAPSLOCK {
+            if value == 1 {
+                self.caps_lock = !self.caps_lock;
+            }
+            return true;
+        }
+        if is_modifier(evdev_keycode) {
+            if value == 0 {
+                self.pressed.remove(&evdev_keycode);
+            } else {
+                self.pressed.insert(evdev_keycode);
+            }
+            return true;
+        }
+        false
+    }
+
+    fn state(&self) -> u16 {
+        let mut state = 0;
+        if self.pressed.contains(&EVDEV_LEFTSHIFT) || self.pressed.contains(&EVDEV_RIGHTSHIFT) {
+            state |= SHIFT_MASK;
+        }
+        if self.pressed.contains(&EVDEV_LEFTCTRL) || self.pressed.contains(&EVDEV_RIGHTCTRL) {
+            state |= CONTROL_MASK;
+        }
+        if self.pressed.contains(&EVDEV_LEFTALT) || self.pressed.contains(&EVDEV_RIGHTALT) {
+            state |= ALT_MASK;
+        }
+        if self.pressed.contains(&EVDEV_LEFTMETA) || self.pressed.contains(&EVDEV_RIGHTMETA) {
+            state |= SUPER_MASK;
+        }
+        if self.caps_lock {
+            state |= LOCK_MASK;
+        }
+        state
+    }
+}
+
+fn is_modifier(evdev_keycode: u16) -> bool {
+    matches!(
+        evdev_keycode,
+        EVDEV_LEFTSHIFT
+            | EVDEV_RIGHTSHIFT
+            | EVDEV_LEFTCTRL
+            | EVDEV_RIGHTCTRL
+            | EVDEV_LEFTALT
+            | EVDEV_RIGHTALT
+            | EVDEV_LEFTMETA
+            | EVDEV_RIGHTMETA
+    )
+}
+
+enum Capture {
+    X11(XRecordCapture),
+    Evdev(EvdevCapture),
+}
+
+enum CapturedEvent {
+    X11(KeyEvent),
+    Evdev(EvdevKeyEvent),
+}
+
+impl Capture {
+    fn backend_name(&self) -> &'static str {
+        match self {
+            Self::X11(_) => "xrecord",
+            Self::Evdev(_) => "evdev",
+        }
+    }
+
+    fn recv_timeout(&mut self, timeout: Duration) -> Result<Option<CapturedEvent>, Box<dyn Error>> {
+        match self {
+            Self::X11(capture) => Ok(capture.recv_timeout(timeout)?.map(CapturedEvent::X11)),
+            Self::Evdev(capture) => Ok(capture.recv_timeout(timeout)?.map(CapturedEvent::Evdev)),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::X11(capture) => {
+                let _ = capture.stop();
+            }
+            Self::Evdev(capture) => capture.stop(),
+        }
+    }
+}
+
 struct Daemon {
-    capture: XRecordCapture,
+    config: Config,
+    capture: Capture,
     injector: X11Injector,
     layouts: X11LayoutState,
     focus: X11Focus,
@@ -40,33 +156,50 @@ struct Daemon {
     app_id: Option<String>,
     window: Option<u32>,
     last_focus_poll: Instant,
+    last_input: Instant,
+    idle_timeout: Duration,
+    clear_on_focus_change: bool,
     ignore: VecDeque<(u8, bool)>,
     ignore_until: Instant,
+    evdev_modifiers: EvdevModifiers,
     dry_run: bool,
 }
 
 impl Daemon {
-    fn new(dry_run: bool) -> Result<Self, Box<dyn Error>> {
-        let capture = XRecordCapture::new()?;
-        let injector = X11Injector::new()?;
-        let layouts = X11LayoutState::new(vec![LayoutId::Us, LayoutId::Ru])?;
+    fn new(dry_run: bool, config: Config) -> Result<Self, Box<dyn Error>> {
+        let capture = open_capture(&config)?;
+        let injector = open_injector(&config)?;
+        let layout_order = config.layout_order();
+        let layouts = match config.layout.backend {
+            LayoutBackend::Auto | LayoutBackend::X11 => X11LayoutState::new(layout_order)?,
+            other => return Err(format!("layout backend {other:?} is not wired yet").into()),
+        };
         let focus = X11Focus::new()?;
         let active_layout = layouts.active_layout().ok().flatten();
+        let resolver = config.to_profile_resolver();
+        let profile = resolver.resolve("");
+        let idle_timeout = Duration::from_millis(config.privacy.buffer_idle_timeout_ms.max(1));
+        let clear_on_focus_change = config.privacy.clear_on_focus_change;
 
         let mut daemon = Self {
+            manager: CorrectionManager::new(config.to_engine_config(), DictionaryDetector::new()),
+            config,
             capture,
             injector,
             layouts,
             focus,
-            manager: CorrectionManager::new(EngineConfig::default(), DictionaryDetector::new()),
-            resolver: default_resolver(),
+            resolver,
             active_layout,
-            profile: Profile::Auto,
+            profile,
             app_id: None,
             window: None,
             last_focus_poll: Instant::now() - Duration::from_secs(2),
+            last_input: Instant::now(),
+            idle_timeout,
+            clear_on_focus_change,
             ignore: VecDeque::new(),
             ignore_until: Instant::now(),
+            evdev_modifiers: EvdevModifiers::default(),
             dry_run,
         };
         daemon.refresh_focus(true);
@@ -75,8 +208,12 @@ impl Daemon {
 
     fn run(mut self) -> Result<(), Box<dyn Error>> {
         println!(
-            "layoutpilot: X11 capture active, dry_run={}, layout={:?}, app={:?}",
-            self.dry_run, self.active_layout, self.app_id
+            "layoutpilot: capture={} ({}), dry_run={}, layout={:?}, app={:?}",
+            self.capture.backend_name(),
+            config_backend_name(self.config.capture.backend),
+            self.dry_run,
+            self.active_layout,
+            self.app_id
         );
         loop {
             if Instant::now() >= self.ignore_until {
@@ -87,17 +224,53 @@ impl Daemon {
                 Ok(Some(event)) => {
                     self.refresh_layout();
                     self.refresh_focus(false);
-                    self.handle_key(event)?;
+                    self.handle_captured(event)?;
                 }
                 Ok(None) => {
                     self.refresh_layout();
                     self.refresh_focus(false);
                 }
-                Err(X11Error::CaptureStopped) => break,
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    eprintln!("layoutpilot: capture error: {error}");
+                    break;
+                }
+            }
+
+            if self.last_input.elapsed() >= self.idle_timeout {
+                let engine = self.manager.engine();
+                if !engine.buffer_text().is_empty() || engine.undo_available() {
+                    self.manager.reset(ResetReason::IdleTimeout);
+                }
+                self.last_input = Instant::now();
             }
         }
         Ok(())
+    }
+
+    fn handle_captured(&mut self, event: CapturedEvent) -> Result<(), Box<dyn Error>> {
+        match event {
+            CapturedEvent::X11(event) => self.handle_key(event),
+            CapturedEvent::Evdev(event) => self.handle_evdev(event),
+        }
+    }
+
+    fn handle_evdev(&mut self, event: EvdevKeyEvent) -> Result<(), Box<dyn Error>> {
+        let Some(evdev_keycode) = event.keycode.checked_sub(8) else {
+            return Ok(());
+        };
+        if self.evdev_modifiers.update(evdev_keycode, event.value) {
+            return Ok(());
+        }
+        let Ok(keycode) = u8::try_from(event.keycode) else {
+            return Ok(());
+        };
+        let x11_event = KeyEvent {
+            keycode,
+            state: self.evdev_modifiers.state(),
+            time: 0,
+            pressed: event.pressed(),
+        };
+        self.handle_key(x11_event)
     }
 
     fn handle_key(&mut self, event: KeyEvent) -> Result<(), Box<dyn Error>> {
@@ -107,6 +280,7 @@ impl Daemon {
         if !event.pressed {
             return Ok(());
         }
+        self.last_input = Instant::now();
 
         match event.keycode {
             BACKSPACE_KEYCODE => {
@@ -230,7 +404,7 @@ impl Daemon {
                 self.window = Some(info.window);
                 self.app_id = info.app_id;
                 self.profile = self.resolver.resolve(self.app_id.as_deref().unwrap_or(""));
-                if window_changed || app_changed {
+                if (window_changed || app_changed) && self.clear_on_focus_change {
                     self.manager.reset(ResetReason::FocusChange);
                 }
             }
@@ -238,27 +412,69 @@ impl Daemon {
                 if self.window.take().is_some() {
                     self.app_id = None;
                     self.profile = Profile::Auto;
-                    self.manager.reset(ResetReason::FocusChange);
+                    if self.clear_on_focus_change {
+                        self.manager.reset(ResetReason::FocusChange);
+                    }
                 }
             }
         }
     }
 }
 
-fn default_resolver() -> ProfileResolver {
-    ProfileResolver::new(Profile::Auto)
-        .with_rule(AppRule::new("*terminal*", Profile::Manual))
-        .with_rule(AppRule::new("*konsole*", Profile::Manual))
-        .with_rule(AppRule::new("*alacritty*", Profile::Manual))
-        .with_rule(AppRule::new("*kitty*", Profile::Manual))
-        .with_rule(AppRule::new("*keepass*", Profile::Off))
+fn open_capture(config: &Config) -> Result<Capture, Box<dyn Error>> {
+    let backend = match config.capture.backend {
+        CaptureBackend::Auto if env::var_os("DISPLAY").is_some() => CaptureBackend::Xrecord,
+        CaptureBackend::Auto => CaptureBackend::Evdev,
+        backend => backend,
+    };
+    match backend {
+        CaptureBackend::Xrecord => Ok(Capture::X11(XRecordCapture::new()?)),
+        CaptureBackend::Evdev => Ok(Capture::Evdev(EvdevCapture::open()?)),
+        other => Err(format!(
+            "capture backend {other:?} is not wired yet; use evdev, xrecord or auto"
+        )
+        .into()),
+    }
 }
 
-fn doctor() -> Result<(), Box<dyn Error>> {
+fn config_backend_name(backend: CaptureBackend) -> &'static str {
+    match backend {
+        CaptureBackend::Auto => "auto",
+        CaptureBackend::Evdev => "evdev",
+        CaptureBackend::Xrecord => "xrecord",
+        CaptureBackend::Portal => "portal",
+        CaptureBackend::Ime => "ime",
+    }
+}
+
+fn open_injector(config: &Config) -> Result<X11Injector, Box<dyn Error>> {
+    match config.inject.backend {
+        InjectBackend::Auto | InjectBackend::Xtest => Ok(X11Injector::new()?),
+        other => Err(format!("inject backend {other:?} is not wired yet").into()),
+    }
+}
+
+fn load_config(explicit: Option<PathBuf>) -> Result<(Config, Option<PathBuf>), Box<dyn Error>> {
+    let path = explicit.or_else(Config::default_path);
+    match path {
+        Some(path) => Ok((Config::load_or_default(&path)?, Some(path))),
+        None => Ok((Config::default(), None)),
+    }
+}
+
+fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>> {
     let mut failures = 0;
 
     println!("LayoutPilot doctor");
     println!("DISPLAY: {:?}", env::var("DISPLAY").ok());
+    match path {
+        Some(path) => println!("config: {}", path.display()),
+        None => println!("config: built-in defaults"),
+    }
+    println!(
+        "backends: capture={:?}, inject={:?}, layout={:?}, order={:?}",
+        config.capture.backend, config.inject.backend, config.layout.backend, config.layout.order
+    );
 
     match X11Injector::new() {
         Ok(_) => println!("XTEST: ok"),
@@ -268,7 +484,7 @@ fn doctor() -> Result<(), Box<dyn Error>> {
         }
     }
 
-    match X11LayoutState::new(vec![LayoutId::Us, LayoutId::Ru]) {
+    match X11LayoutState::new(config.layout_order()) {
         Ok(layouts) => match (layouts.group(), layouts.active_layout()) {
             (Ok(group), Ok(active)) => {
                 println!("XKB: ok (group {group}, active {active:?})");
@@ -292,16 +508,14 @@ fn doctor() -> Result<(), Box<dyn Error>> {
         Err(error) => println!("focus: FAIL ({error})"),
     }
 
-    match XRecordCapture::new() {
+    match open_capture(config) {
         Ok(mut capture) => {
-            println!("RECORD: ok");
-            if let Err(error) = capture.stop() {
-                println!("RECORD stop: FAIL ({error})");
-            }
+            println!("capture: ok ({})", capture.backend_name());
+            capture.stop();
         }
         Err(error) => {
             failures += 1;
-            println!("RECORD: FAIL ({error})");
+            println!("capture: FAIL ({error})");
         }
     }
 
@@ -324,31 +538,87 @@ fn print_help() {
     println!(
         "layoutpilot — X11 layout auto-corrector\n\n\
          usage:\n\
-         \x20 layoutpilot doctor          check X11 backends and dictionaries\n\
-         \x20 layoutpilot run             run the daemon (default)\n\
-         \x20 layoutpilot run --dry-run   print plans without injecting\n\n\
-         Set DISPLAY to the target X11 session."
+         \x20 layoutpilot doctor [--config PATH]   check backends and dictionaries\n\
+         \x20 layoutpilot run [--dry-run] [--config PATH]\n\n\
+         Config defaults to $XDG_CONFIG_HOME/layoutpilot/config.toml or\n\
+         $HOME/.config/layoutpilot/config.toml. Set DISPLAY for X11."
     );
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Command {
+    Run { dry_run: bool },
+    Doctor,
+    Help,
+}
+
+fn parse_args(args: &[String]) -> Result<(Command, Option<PathBuf>), String> {
+    let mut command = None;
+    let mut dry_run = false;
+    let mut config = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "run" => {
+                if command.is_some() {
+                    return Err("only one command is allowed".to_owned());
+                }
+                command = Some(Command::Run { dry_run: false });
+            }
+            "doctor" => {
+                if command.is_some() {
+                    return Err("only one command is allowed".to_owned());
+                }
+                command = Some(Command::Doctor);
+            }
+            "--dry-run" => dry_run = true,
+            "--config" => {
+                index += 1;
+                let value = args
+                    .get(index)
+                    .ok_or_else(|| "--config requires a path".to_owned())?;
+                config = Some(PathBuf::from(value));
+            }
+            "-h" | "--help" => command = Some(Command::Help),
+            other => return Err(format!("unknown argument: {other}")),
+        }
+        index += 1;
+    }
+
+    let command = match command {
+        Some(Command::Run { .. }) | None => Command::Run { dry_run },
+        Some(command) => command,
+    };
+    Ok((command, config))
 }
 
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
-    let result = match args.as_slice() {
-        [] => Daemon::new(false).and_then(Daemon::run),
-        [command] if command == "doctor" => doctor(),
-        [command] if command == "run" => Daemon::new(false).and_then(Daemon::run),
-        [command, flag] if command == "run" && flag == "--dry-run" => {
-            Daemon::new(true).and_then(Daemon::run)
+    let result = (|| -> Result<(), Box<dyn Error>> {
+        let (command, config_path) = parse_args(&args)?;
+        match command {
+            Command::Help => {
+                print_help();
+                Ok(())
+            }
+            Command::Doctor => {
+                let (config, path) = load_config(config_path)?;
+                doctor(&config, path.as_ref())
+            }
+            Command::Run { dry_run } => {
+                let (config, path) = load_config(config_path)?;
+                if !config.general.enabled {
+                    println!("layoutpilot: disabled by config; exiting");
+                    return Ok(());
+                }
+                match path {
+                    Some(path) => println!("layoutpilot: config {}", path.display()),
+                    None => println!("layoutpilot: built-in config"),
+                }
+                Daemon::new(dry_run, config)?.run()
+            }
         }
-        [command] if command == "-h" || command == "--help" => {
-            print_help();
-            Ok(())
-        }
-        _ => {
-            print_help();
-            return ExitCode::from(2);
-        }
-    };
+    })();
 
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -365,7 +635,7 @@ mod tests {
 
     #[test]
     fn terminal_defaults_to_manual() {
-        let resolver = default_resolver();
+        let resolver = Config::default().to_profile_resolver();
         assert_eq!(
             resolver.resolve("org.gnome.Terminal"),
             layoutpilot_core::Profile::Manual
@@ -382,5 +652,46 @@ mod tests {
             resolver.resolve("org.gnome.TextEditor"),
             layoutpilot_core::Profile::Auto
         );
+    }
+
+    #[test]
+    fn evdev_modifiers_follow_press_and_release() {
+        let mut modifiers = EvdevModifiers::default();
+        assert!(modifiers.update(EVDEV_LEFTSHIFT, 1));
+        assert_eq!(modifiers.state() & SHIFT_MASK, SHIFT_MASK);
+        let _ = modifiers.update(EVDEV_LEFTSHIFT, 0);
+        assert_eq!(modifiers.state() & SHIFT_MASK, 0);
+
+        let _ = modifiers.update(EVDEV_LEFTCTRL, 1);
+        let _ = modifiers.update(EVDEV_LEFTMETA, 1);
+        assert_eq!(modifiers.state() & CONTROL_MASK, CONTROL_MASK);
+        assert_eq!(modifiers.state() & SUPER_MASK, SUPER_MASK);
+
+        assert!(modifiers.update(EVDEV_CAPSLOCK, 1));
+        assert_eq!(modifiers.state() & LOCK_MASK, LOCK_MASK);
+        let _ = modifiers.update(EVDEV_CAPSLOCK, 1);
+        assert_eq!(modifiers.state() & LOCK_MASK, 0);
+        assert!(!modifiers.update(30, 1));
+    }
+
+    #[test]
+    fn parses_cli() {
+        let args = vec!["run".to_owned(), "--dry-run".to_owned()];
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            (Command::Run { dry_run: true }, None)
+        );
+
+        let args = vec![
+            "doctor".to_owned(),
+            "--config".to_owned(),
+            "x.toml".to_owned(),
+        ];
+        assert_eq!(
+            parse_args(&args).unwrap(),
+            (Command::Doctor, Some(PathBuf::from("x.toml")))
+        );
+
+        assert!(parse_args(&["bogus".to_owned()]).is_err());
     }
 }

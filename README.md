@@ -1,8 +1,8 @@
 # LayoutPilot
 
 Автопереключатель раскладки клавиатуры для Linux. Проект находится на раннем
-этапе: готовы платформенно-независимое ядро, движок, словарный скоринг и
-X11-демон; evdev и Wayland-бэкенды ещё не реализованы.
+этапе: готовы платформенно-независимое ядро, движок, словарный скоринг,
+X11-демон, evdev-capture и конфиг; Wayland-инъекция ещё не реализована.
 
 - ТЗ: [`tz-layout-switcher-v0.2.md`](tz-layout-switcher-v0.2.md)
 - Решения: [`docs/decisions.md`](docs/decisions.md)
@@ -10,12 +10,13 @@ X11-демон; evdev и Wayland-бэкенды ещё не реализован
 - Движок: [`docs/engine.md`](docs/engine.md)
 - Словари и скоринг: [`docs/dictionaries.md`](docs/dictionaries.md)
 - Демон: [`docs/daemon.md`](docs/daemon.md)
+- Конфиг: [`docs/config.md`](docs/config.md)
 
 ## Что уже работает
 
 `layoutpilot-core` — чистая библиотека без I/O и системных вызовов:
 
-- таблицы `us`/`ru`, сгенерированные из XKB (118 буквенных привязок, 189 записей с пунктуацией);
+- таблицы `us`/`ru`, сгенерированные из XKB (118 буквенных привязок, 196 записей с пунктуацией);
 - конвертация переинтерпретацией физических клавиш: `ghbdtn` → `привет`;
 - сохранение регистра, пунктуации, цифр и пробелов;
 - строгая проверка клавиатурной обратимости для слов;
@@ -34,13 +35,30 @@ X11-демон; evdev и Wayland-бэкенды ещё не реализован
 - undo/redo с инвалидацией при любом новом вводе или сбросе контекста (FR-04);
 - `Action::Replace/Undo/Redo` с числом Backspace и текстом для инжектора.
 
-`layoutpilot-daemon` — исполняемый вертикальный срез для X11:
+`layoutpilot-daemon` — исполняемый вертикальный срез:
 
-- XRecord → нормализация → `Engine`/`DictionaryDetector` → XTest + XKB;
-- `doctor` для проверки XTEST, XKB, RECORD, фокуса и словарей;
+- XRecord или evdev → нормализация → `Engine`/`DictionaryDetector` → XTest + XKB;
+- `doctor` для проверки XTEST, XKB, RECORD/evdev, фокуса и словарей;
 - `run --dry-run` для просмотра планов без инъекции;
+- конфиг `~/.config/layoutpilot/config.toml` или `--config PATH`;
+- порядок XKB-групп задаётся в `[layout] order`;
 - подавление собственных XTest-событий по журналу инъектора;
 - профили по `WM_CLASS` (терминалы — `manual`, KeePass — `off`).
+
+`layoutpilot-config` — TOML-конфиг:
+
+- секции `[general]`, `[capture]`, `[privacy]`, `[inject]`, `[layout]`,
+  `[ime]`, `[apps]`;
+- значения по умолчанию и валидация;
+- `[apps]` → `ProfileResolver`, `[general]` → `EngineConfig`;
+- пример: [`config.example.toml`](config.example.toml).
+
+`layoutpilot-capture` — evdev:
+
+- перечисление `/dev/input/event*` и фильтр клавиатур по letter-keys;
+- неблокирующее чтение в отдельном потоке на устройство;
+- evdev keycode → XKB keycode (`+8`);
+- hotplug пока не поддерживается.
 
 `layoutpilot-x11` — первый платформенный срез:
 
@@ -91,6 +109,7 @@ cargo run -p layoutpilot-core --example engine -- "ghbdtn "
 cargo run -p layoutpilot-dict --example detect -- ghbdtn привет
 cargo run -p layoutpilot-dict --example calibrate -- 5000
 cargo run -p layoutpilot-daemon -- doctor
+cargo run -p layoutpilot-daemon -- doctor --config config.example.toml
 cargo run -p layoutpilot-daemon -- run --dry-run
 ```
 
@@ -104,7 +123,10 @@ crates/
   layoutpilot-core/      конвертация, сегментация, буфер, движок
   layoutpilot-dict/      FST-словари, биграммы, DictionaryDetector
   layoutpilot-x11/       XTest, XRecord, XKB state, фокус
+  layoutpilot-config/    TOML, валидация, профили, порядок раскладок
+  layoutpilot-capture/   evdev-захват клавиатур
   layoutpilot-daemon/    бинарник layoutpilot: capture → engine → inject
+config.example.toml      пример конфигурации
 data/
   xkb/                   сгенерированные таблицы и их происхождение
   dict/                  FrequencyWords (CC BY-SA 4.0), FST собирается из них
@@ -131,14 +153,15 @@ cargo test --workspace
   считаются неизвестными.
 - Нет word-bigram контекста и layout prior; калибровка температуры и
   `known_bias` предварительная (этап 3).
-- Платформенный слой начат с X11: есть демон, XTest, XRecord и XKB. Нет evdev,
-  Wayland-инъекции, глобальных хоткеев и per-window раскладки.
+- Есть X11-демон и evdev-capture, но нет Wayland-инъекции (EIS/virtual-keyboard).
+  evdev на чистом Wayland без XWayland пока не даёт переключать раскладку.
 - XRecord видит только X11/XWayland-приложения; layout state пока опрашивается
   по требованию, без `XkbStateNotify`.
-- Порядок XKB-групп фиксирован (`us`, `ru`); конфиг и автоопределение ещё
-  не сделаны.
-- Резолвер профилей есть, но интеграция с фокусом/`app_id` появится вместе с
-  платформенным слоем.
+- evdev перечисляет устройства один раз при старте: hotplug не реализован.
+- Порядок XKB-групп задаётся в конфиге, но автоопределение групп ещё не сделано.
+- Нет hot reload конфига, глобальных хоткеев undo/fix/pause и per-window
+  раскладки.
+- Обучение и LLM-поля конфига читаются, но пока не влияют на поведение.
 
 ## Лицензия
 

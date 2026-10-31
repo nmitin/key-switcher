@@ -1,0 +1,84 @@
+# Конфигурация
+
+Файл: `~/.config/layoutpilot/config.toml` (или `$XDG_CONFIG_HOME/layoutpilot/config.toml`).
+Демон читает его при старте; `--config PATH` переопределяет путь. Если файла нет —
+используются встроенные значения. Неизвестные поля игнорируются, некорректные
+значения отвергаются с понятной ошибкой.
+
+Пример: [`config.example.toml`](../config.example.toml).
+
+## Основные секции
+
+| Секция | Что задаёт |
+|---|---|
+| `[general]` | включение, языки, триггеры, минимальная длина, порог, хоткеи |
+| `[capture]` | `auto`, `evdev`, `xrecord`, `portal`, `ime` |
+| `[privacy]` | обучение, таймауты, очистка при смене фокуса, LLM |
+| `[inject]` | `auto`, `xtest`, `eis`, `virtual-keyboard`, `uinput`, `clipboard` |
+| `[layout]` | backend, per-window, **порядок XKB-групп** |
+| `[ime]` | отключение авто при активном IME |
+| `[apps]` | профили по `WM_CLASS`/`app_id` |
+
+## Порядок раскладок
+
+```toml
+[layout]
+order = ["us", "ru"]
+```
+
+`order[0]` — `XkbGroup1`, `order[1]` — `XkbGroup2`, и так далее (до четырёх).
+Для сессии, где русский стоит первым, используйте `["ru", "us"]`.
+Это заменяет прежнюю жёсткую привязку `us` → group 1.
+
+## Триггеры
+
+```toml
+triggers = ["space", "punct"]
+```
+
+`tab` добавляет Tab в `aggressive`; Enter не поддерживается. Отсутствие
+`space`/`punct` отключает соответствующий триггер в движке.
+
+## Профили приложений
+
+```toml
+[apps."org.telegram.desktop"]
+mode = "aggressive"
+
+[apps."*terminal*"]
+mode = "manual"
+
+[apps."*"]
+mode = "auto"
+```
+
+Порядок: точное имя → glob по убыванию специфичности → `*`.
+`*terminal*`, `*konsole*`, `*alacritty*`, `*kitty*` по умолчанию `manual`,
+`*keepass*` — `off`.
+
+## Backend'ы
+
+- `capture = "auto"` выбирает `xrecord`, если задан `DISPLAY`, иначе `evdev`.
+- `capture = "evdev"` требует доступ к `/dev/input/event*`; добавьте пользователя
+  в группу `input` или настройте ACL.
+- `inject = "auto"` сейчас означает XTEST на X11. EIS/virtual-keyboard/uinput
+  ещё не реализованы.
+- `layout = "auto"` сейчас означает X11 XKB. Нативные KDE/GNOME/Sway/Hyprland
+  бэкенды ещё не реализованы.
+
+## Валидация
+
+Проверяется:
+
+- `min_word_len` в `1..=64`;
+- `confidence_threshold` в `[0, 1]`;
+- `privacy.store_keystrokes = false` (в v1 иначе ошибка);
+- `layout.order` — 2–4 уникальные раскладки;
+- непустые `apps`-паттерны.
+
+## Ограничения
+
+- Hot reload ещё не подключён: изменения применяются после перезапуска.
+- `learning`, LLM-поля и хоткеи пока только читаются/валидируются; поведение
+  для них появится на следующих этапах.
+- `history_size` не создаёт историю: в v1 история не хранится.

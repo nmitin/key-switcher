@@ -1,0 +1,51 @@
+# LayoutPilot configuration (TZ §10).
+# Copy to ~/.config/layoutpilot/config.toml or pass --config PATH.
+
+[general]
+enabled = true
+languages = ["ru", "en"]
+triggers = ["space", "punct"]      # space | punct | tab; enter is never a trigger
+min_word_len = 3
+confidence_threshold = 0.97
+undo_hotkey = "Pause"
+fix_hotkey = "Ctrl+Shift+F"
+pause_hotkey = "Ctrl+Shift+P"
+
+[capture]
+backend = "auto"                   # auto | evdev | xrecord | portal | ime
+
+[privacy]
+store_keystrokes = false           # must be false in v1
+learning = true
+history_size = 0                   # 0 = do not store history
+buffer_idle_timeout_ms = 60000
+clear_on_focus_change = true
+llm = "off"                        # off | local
+llm_model = "qwen2.5-1.5b-instruct-q4_k_m.gguf"
+llm_timeout_ms = 300
+llm_suggest = true
+
+[inject]
+backend = "auto"                   # auto | xtest | eis | virtual-keyboard | uinput | clipboard
+allow_uinput_in_games = false
+restore_clipboard = true
+
+[layout]
+backend = "auto"                   # auto | kde | gnome | sway | hyprland | x11
+per_window = true
+order = ["us", "ru"]               # XKB group order: Group1, Group2, ...
+
+[ime]
+disable_auto_when_active = true
+
+[apps."org.telegram.desktop"]
+mode = "aggressive"
+
+[apps."*terminal*"]
+mode = "manual"
+
+[apps."*keepass*"]
+mode = "off"
+
+[apps."*"]
+mode = "auto"

@@ -1,0 +1,15 @@
+[package]
+name = "layoutpilot-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "TOML configuration, validation and profile mapping for LayoutPilot"
+
+[dependencies]
+layoutpilot-core = { path = "../layoutpilot-core" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[lints]
+workspace = true

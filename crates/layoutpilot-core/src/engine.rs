@@ -470,11 +470,12 @@ impl<D: Detector> Engine<D> {
     }
 
     fn is_trigger(&self, ch: char, profile: Profile) -> bool {
-        ch == ' '
-            || matches!(
-                ch,
-                '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"'
-            )
+        (ch == ' ' && self.config.space_trigger)
+            || (self.config.punct_trigger
+                && matches!(
+                    ch,
+                    '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '"'
+                ))
             || (ch == '\t'
                 && profile == Profile::Aggressive
                 && self.config.tab_trigger_in_aggressive)
@@ -703,6 +704,23 @@ mod tests {
 
         let mut engine = Engine::new(EngineConfig::default(), detector());
         assert_eq!(type_text(&mut engine, "/usr/ghbdtn ", &auto()), None);
+    }
+
+    #[test]
+    fn triggers_can_be_disabled_by_config() {
+        let config = EngineConfig {
+            space_trigger: false,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config, detector());
+        assert_eq!(type_text(&mut engine, "ghbdtn ", &auto()), None);
+
+        let config = EngineConfig {
+            punct_trigger: false,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config, detector());
+        assert_eq!(type_text(&mut engine, "ghbdtn,", &auto()), None);
     }
 
     #[test]
