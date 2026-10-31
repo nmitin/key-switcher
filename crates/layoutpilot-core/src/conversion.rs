@@ -237,7 +237,7 @@ pub fn reinterpret_word(
 
     let chars: Vec<char> = word.chars().collect();
     let mut output = String::with_capacity(word.len());
-    for (index, &ch) in chars.iter().enumerate() {
+    for &ch in &chars {
         if ch.is_alphabetic() {
             let keystroke =
                 source
@@ -258,12 +258,8 @@ pub fn reinterpret_word(
         }
 
         // Punctuation can be a real letter in the other layout (`.` → `ю`,
-        // `[` → `х`). Do not map leading punctuation, but do map internal and
-        // trailing punctuation that the caller kept in the core token.
-        if index == 0 {
-            output.push(ch);
-            continue;
-        }
+        // `;` → `ж`, `[` → `х`). Map it anywhere in the token, including the
+        // first character: `;bpym` must become `жизнь`, not `;изнь`.
         let mapped = source
             .keystroke_for(ch)
             .and_then(|keystroke| target.char_at(keystroke));
@@ -436,6 +432,7 @@ mod tests {
     fn reinterpret_word_maps_punctuation_that_is_a_letter() {
         assert_eq!(reinterpret_word("cfk.n", us(), ru()).unwrap(), "салют");
         assert_eq!(reinterpret_word("cvt[", us(), ru()).unwrap(), "смех");
+        assert_eq!(reinterpret_word(";bpym", us(), ru()).unwrap(), "жизнь");
         assert_eq!(reinterpret_word("ghbdtn.", us(), ru()).unwrap(), "приветю");
     }
 

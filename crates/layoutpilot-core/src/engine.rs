@@ -356,11 +356,10 @@ impl<D: Detector> Engine<D> {
         // other layout, when punctuation triggers are disabled, or when Shift
         // is held (injecting during Shift would uppercase the replacement).
         // Trailing sentence punctuation is split off later and preserved.
-        if !self.current_word.is_empty()
-            && is_punctuation(ch)
-            && (!self.config.punct_trigger
-                || context.modifiers.shift
-                || punctuation_is_letter(ch, context.active_layout))
+        if is_punctuation(ch)
+            && (punctuation_is_letter(ch, context.active_layout)
+                || (!self.current_word.is_empty()
+                    && (!self.config.punct_trigger || context.modifiers.shift)))
         {
             self.current_word.push(ch);
             self.buffer.push(ch);
@@ -614,6 +613,7 @@ mod tests {
             "мир",
             "vbh",
             "hello",
+            "жизнь",
             "салют",
             "смех",
         ])
@@ -667,6 +667,16 @@ mod tests {
         assert_eq!(correction.converted, "привет.");
         assert_eq!(correction.separator, Some(' '));
         assert_eq!(correction.insert_text(true), "привет. ");
+    }
+
+    #[test]
+    fn corrects_punctuation_letter_at_start_of_word() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        let correction = replace(type_text(&mut engine, ";bpym ", &auto()));
+        assert_eq!(correction.original, ";bpym");
+        assert_eq!(correction.converted, "жизнь");
+        assert_eq!(correction.word_chars, 5);
+        assert_eq!(correction.separator, Some(' '));
     }
 
     #[test]
