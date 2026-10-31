@@ -213,6 +213,68 @@ pub fn convert_word(
     Ok(output)
 }
 
+/// Reinterpret a token that may contain punctuation acting as a letter.
+///
+/// This is the wrong-layout conversion used by the engine: punctuation inside a
+/// word is mapped through the physical keys when the target layout has an
+/// alphabetic letter on that key. Trailing sentence punctuation must be split
+/// off by the caller before calling this function.
+///
+/// Examples (US → RU): `cfk.n` → `салют`, `cvt[` → `смех`.
+///
+/// # Errors
+///
+/// Returns an error if an alphabetic character has no source key or the target
+/// has no character on the corresponding key.
+pub fn reinterpret_word(
+    word: &str,
+    source: &LayoutTable,
+    target: &LayoutTable,
+) -> Result<String, ConversionError> {
+    if word.is_empty() {
+        return Err(ConversionError::EmptyWord);
+    }
+
+    let chars: Vec<char> = word.chars().collect();
+    let mut output = String::with_capacity(word.len());
+    for (index, &ch) in chars.iter().enumerate() {
+        if ch.is_alphabetic() {
+            let keystroke =
+                source
+                    .keystroke_for(ch)
+                    .ok_or(ConversionError::MissingSourceKeystroke {
+                        ch,
+                        layout: source.id(),
+                    })?;
+            let mapped = target
+                .char_at(keystroke)
+                .ok_or(ConversionError::MissingTargetChar {
+                    ch,
+                    keystroke,
+                    layout: target.id(),
+                })?;
+            output.push(mapped);
+            continue;
+        }
+
+        // Punctuation can be a real letter in the other layout (`.` → `ю`,
+        // `[` → `х`). Do not map leading punctuation, but do map internal and
+        // trailing punctuation that the caller kept in the core token.
+        if index == 0 {
+            output.push(ch);
+            continue;
+        }
+        let mapped = source
+            .keystroke_for(ch)
+            .and_then(|keystroke| target.char_at(keystroke));
+        match mapped {
+            Some(mapped) if mapped.is_alphabetic() => output.push(mapped),
+            _ => output.push(ch),
+        }
+    }
+    Ok(output)
+}
+
 /// The result of converting the last word in a text fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastWordConversion {
@@ -368,6 +430,13 @@ mod tests {
             let back = convert_word(&us_word, us(), ru()).unwrap();
             assert_eq!(back, word);
         }
+    }
+
+    #[test]
+    fn reinterpret_word_maps_punctuation_that_is_a_letter() {
+        assert_eq!(reinterpret_word("cfk.n", us(), ru()).unwrap(), "салют");
+        assert_eq!(reinterpret_word("cvt[", us(), ru()).unwrap(), "смех");
+        assert_eq!(reinterpret_word("ghbdtn.", us(), ru()).unwrap(), "приветю");
     }
 
     #[test]

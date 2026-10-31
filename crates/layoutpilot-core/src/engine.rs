@@ -12,7 +12,7 @@
 use layoutpilot_layouts::LayoutId;
 
 use crate::buffer::CharBuffer;
-use crate::conversion::convert_word;
+use crate::conversion::reinterpret_word;
 use crate::detector::{DetectionContext, Detector};
 use crate::profile::{EngineConfig, Profile};
 use crate::protection::is_protected_context;
@@ -346,6 +346,18 @@ impl<D: Detector> Engine<D> {
             return None;
         }
 
+        // Punctuation can be a real letter in the other layout (`.` → `ю`,
+        // `[` → `х`). Keep it inside the word; trailing sentence punctuation
+        // is split off later and preserved.
+        if self.config.punct_trigger
+            && !self.current_word.is_empty()
+            && punctuation_is_letter(ch, context.active_layout)
+        {
+            self.current_word.push(ch);
+            self.buffer.push(ch);
+            return None;
+        }
+
         if self.is_trigger(ch, context.profile) {
             let action = self.evaluate(context, ch);
             self.finish_token(ch);
@@ -384,13 +396,15 @@ impl<D: Detector> Engine<D> {
         }
 
         let target = context.active_layout.other();
-        let converted = convert_word(
-            &self.current_word,
-            context.active_layout.table(),
-            target.table(),
-        )
-        .ok()?;
-        if converted == self.current_word {
+        let (core, suffix) = split_trailing_suffix(&self.current_word);
+        if core.is_empty() {
+            return None;
+        }
+        let converted_core =
+            reinterpret_word(core, context.active_layout.table(), target.table()).ok()?;
+        let mut converted = converted_core;
+        converted.push_str(suffix);
+        if converted == self.current_word || !target.table().can_type(&converted) {
             return None;
         }
 
@@ -496,23 +510,23 @@ impl<D: Detector> Engine<D> {
             return None;
         }
 
-        let letters = self
-            .current_word
+        let target = context.active_layout.other();
+        let (core, suffix) = split_trailing_suffix(&self.current_word);
+        if core.is_empty() {
+            return None;
+        }
+        let converted_core =
+            reinterpret_word(core, context.active_layout.table(), target.table()).ok()?;
+        let letters = converted_core
             .chars()
             .filter(|ch| ch.is_alphabetic())
             .count();
         if letters < self.config.min_word_len_for(context.profile) {
             return None;
         }
-
-        let target = context.active_layout.other();
-        let converted = convert_word(
-            &self.current_word,
-            context.active_layout.table(),
-            target.table(),
-        )
-        .ok()?;
-        if converted == self.current_word {
+        let mut converted = converted_core.clone();
+        converted.push_str(suffix);
+        if converted == self.current_word || !target.table().can_type(&converted) {
             return None;
         }
 
@@ -526,8 +540,8 @@ impl<D: Detector> Engine<D> {
         let confidence = self
             .detector
             .confidence(&DetectionContext {
-                typed: &self.current_word,
-                candidate: &converted,
+                typed: core,
+                candidate: &converted_core,
                 app_id: context.app_id,
                 previous_word,
             })
@@ -546,13 +560,50 @@ impl<D: Detector> Engine<D> {
     }
 }
 
+fn punctuation_is_letter(ch: char, layout: LayoutId) -> bool {
+    layout
+        .table()
+        .keystroke_for(ch)
+        .and_then(|keystroke| layout.other().table().char_at(keystroke))
+        .is_some_and(char::is_alphabetic)
+}
+
+fn is_sentence_suffix(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '!' | '?'
+    )
+}
+
+fn split_trailing_suffix(word: &str) -> (&str, &str) {
+    let mut split = word.len();
+    for (index, ch) in word.char_indices().rev() {
+        if is_sentence_suffix(ch) {
+            split = index;
+        } else {
+            break;
+        }
+    }
+    word.split_at(split)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::detector::LexiconDetector;
 
     fn detector() -> LexiconDetector {
-        LexiconDetector::from_words(["привет", "прив", "пр", "мир", "vbh", "hello", "руддщ"])
+        LexiconDetector::from_words([
+            "привет",
+            "прив",
+            "пр",
+            "мир",
+            "vbh",
+            "hello",
+            "руддщ",
+            "салют",
+            "смех",
+        ])
     }
 
     fn auto() -> InputContext<'static> {
@@ -594,11 +645,41 @@ mod tests {
     }
 
     #[test]
-    fn corrects_on_punctuation_and_preserves_it() {
+    fn trailing_punctuation_is_preserved_until_space() {
         let mut engine = Engine::new(EngineConfig::default(), detector());
-        let correction = replace(type_text(&mut engine, "ghbdtn,", &auto()));
-        assert_eq!(correction.separator, Some(','));
-        assert_eq!(correction.insert_text(true), "привет,");
+        type_text(&mut engine, "ghbdtn", &auto());
+        assert_eq!(engine.on_char('.', &auto()), None);
+        let correction = replace(engine.on_char(' ', &auto()));
+        assert_eq!(correction.original, "ghbdtn.");
+        assert_eq!(correction.converted, "привет.");
+        assert_eq!(correction.separator, Some(' '));
+        assert_eq!(correction.insert_text(true), "привет. ");
+    }
+
+    #[test]
+    fn corrects_punctuation_letter_inside_a_word() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        let correction = replace(type_text(&mut engine, "cfk.n ", &auto()));
+        assert_eq!(correction.original, "cfk.n");
+        assert_eq!(correction.converted, "салют");
+        assert_eq!(correction.delete_chars(true), 6);
+        assert_eq!(correction.insert_text(true), "салют ");
+    }
+
+    #[test]
+    fn corrects_a_bracket_letter_at_the_end() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        let correction = replace(type_text(&mut engine, "cvt[ ", &auto()));
+        assert_eq!(correction.original, "cvt[");
+        assert_eq!(correction.converted, "смех");
+    }
+
+    #[test]
+    fn unambiguous_trigger_still_fires_immediately() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        let correction = replace(type_text(&mut engine, "ghbdtn!", &auto()));
+        assert_eq!(correction.separator, Some('!'));
+        assert_eq!(correction.insert_text(true), "привет!");
     }
 
     #[test]

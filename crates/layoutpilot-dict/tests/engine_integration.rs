@@ -65,12 +65,23 @@ fn corrects_wrong_layout_with_dictionary_scoring() {
 }
 
 #[test]
+fn corrects_punctuation_that_is_a_letter() {
+    let context = context(Profile::Auto, LayoutId::Us);
+    let mut engine = engine();
+    let correction = replacement(type_text(&mut engine, "cfk.n ", &context));
+    assert_eq!(correction.original, "cfk.n");
+    assert_eq!(correction.converted, "салют");
+    assert_eq!(correction.insert_text(true), "салют ");
+}
+
+#[test]
 fn preserves_case_and_punctuation() {
     let context = context(Profile::Auto, LayoutId::Us);
     let mut engine = engine();
     let correction = replacement(type_text(&mut engine, "Ghbdtn, ", &context));
-    assert_eq!(correction.converted, "Привет");
-    assert_eq!(correction.insert_text(true), "Привет,");
+    assert_eq!(correction.original, "Ghbdtn,");
+    assert_eq!(correction.converted, "Привет,");
+    assert_eq!(correction.insert_text(true), "Привет, ");
 }
 
 #[test]

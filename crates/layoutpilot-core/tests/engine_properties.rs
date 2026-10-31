@@ -18,7 +18,9 @@ const US_LETTERS: &[char] = &[
     'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
 ];
 
-const TRIGGERS: &[char] = &[' ', ',', '.', '!', '?', ';', ':', ')', ']', '}', '"'];
+// `]` and `}` are deliberately absent: in RU they are letters (`ъ`, `Ъ`),
+// and as trailing punctuation they may not be typeable in the target layout.
+const TRIGGERS: &[char] = &[' ', ',', '.', '!', '?', ';', ':', ')', '"'];
 
 fn word() -> impl Strategy<Value = String> {
     vec(select(US_LETTERS), 3..20).prop_map(|chars| chars.into_iter().collect())
@@ -98,7 +100,8 @@ proptest! {
     #[test]
     fn every_trigger_fires(word in word()) {
         for trigger in TRIGGERS {
-            let input = format!("{word}{trigger}");
+            // Ambiguous punctuation (`.,;:"`) is deferred until the space.
+            let input = format!("{word}{trigger} ");
             let mut engine = new_engine();
             let action = type_text(&mut engine, &input);
             prop_assert!(matches!(action, Some(Action::Replace(_))));

@@ -3,3 +3,4 @@
 /rustup-init.sh
 *.swp
 .DS_Store
+*.proptest-regressions

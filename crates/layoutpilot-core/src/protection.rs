@@ -18,12 +18,27 @@ pub fn is_protected_token(token: &str) -> bool {
         || token.contains('@')
         || token.contains('/')
         || token.contains('\\')
-        || token.contains('.')
         || token.contains('_')
+        || looks_like_domain(token)
         || lower.starts_with("www.")
         || token.starts_with('$')
         || token.starts_with('#')
         || (token.starts_with('-') && token.chars().count() > 1)
+}
+
+fn looks_like_domain(token: &str) -> bool {
+    let trimmed = token.trim_end_matches(|ch: char| {
+        matches!(
+            ch,
+            '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '!' | '?'
+        )
+    });
+    if trimmed.matches('.').count() >= 2 {
+        return true;
+    }
+    trimmed
+        .rsplit_once('.')
+        .is_some_and(|(_, tld)| tld.chars().filter(|ch| ch.is_alphabetic()).count() >= 2)
 }
 
 /// Whether the token at the end of `text` is protected.
@@ -69,6 +84,8 @@ mod tests {
         assert!(!is_protected_context("hello"));
         assert!(!is_protected_context("don't"));
         assert!(!is_protected_context("по-русски"));
+        assert!(!is_protected_context("ghbdtn."));
+        assert!(!is_protected_context("cfk.n"));
         assert!(!is_protected_context(""));
     }
 
