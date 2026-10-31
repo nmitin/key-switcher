@@ -107,13 +107,15 @@ const EVDEV_CAPSLOCK: u16 = 58;
 struct SoundPlayer {
     enabled: bool,
     failed: bool,
+    file: PathBuf,
 }
 
 impl SoundPlayer {
-    const fn new(enabled: bool) -> Self {
+    fn new(enabled: bool, file: PathBuf) -> Self {
         Self {
             enabled,
             failed: false,
+            file,
         }
     }
 
@@ -121,11 +123,15 @@ impl SoundPlayer {
         if !self.enabled || self.failed {
             return;
         }
-        const SOUND: &str = "/usr/share/sounds/freedesktop/stereo/dialog-information.oga";
-        if std::path::Path::new(SOUND).exists() && self.spawn("paplay", &[SOUND]) {
+        let Some(sound) = self.file.to_str() else {
+            self.failed = true;
+            eprintln!("layoutpilot: sound file path is not UTF-8; disabling layout sound");
+            return;
+        };
+        if self.file.is_file() && self.spawn("paplay", &[sound]) {
             return;
         }
-        if self.spawn("pw-play", &[SOUND]) {
+        if self.file.is_file() && self.spawn("pw-play", &[sound]) {
             return;
         }
         if self.spawn("canberra-gtk-play", &["--id=bell"]) {
@@ -350,7 +356,10 @@ impl Daemon {
         let layouts = open_layouts(&config)?;
         let focus = X11Focus::new()?;
         let active_layout = layouts.active_layout().ok().flatten();
-        let sound = SoundPlayer::new(config.general.sound_on_layout_change);
+        let sound = SoundPlayer::new(
+            config.general.sound_on_layout_change,
+            PathBuf::from(&config.general.sound_file),
+        );
         let hotkeys = Hotkeys::from_config(&config)?;
         let (hotkey_grabber, grabbed_hotkeys) = setup_hotkey_grabber(&hotkeys);
         let resolver = config.to_profile_resolver();

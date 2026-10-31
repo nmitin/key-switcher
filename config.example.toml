@@ -10,7 +10,8 @@ confidence_threshold = 0.97
 undo_hotkey = "Pause"
 fix_hotkey = "Ctrl+Shift+F"
 pause_hotkey = "Ctrl+Shift+P"
-sound_on_layout_change = true       # короткий звук при смене раскладки
+sound_on_layout_change = true       # звук при смене раскладки
+sound_file = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
 
 [capture]
 backend = "auto"                   # auto | evdev | xrecord | portal | ime

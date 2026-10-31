@@ -74,6 +74,7 @@ pause_hotkey = "Ctrl+Shift+P"
 ```toml
 [general]
 sound_on_layout_change = true
+sound_file = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
 
 [layout]
 backend = "auto"       # на KDE автоматически kde-dbus+xkb
@@ -84,8 +85,9 @@ order = ["us", "ru"]
 дополнительно синхронизирует XKB-группу для XWayland-инъекции. На остальных
 X11-окружениях остаётся XKB group lock.
 
-`sound_on_layout_change` проигрывает короткий системный `bell` при смене
-раскладки — как после коррекции, так и при ручном переключении. Используется
+`sound_on_layout_change` проигрывает звук при смене раскладки — как после
+коррекции, так и при ручном переключении. По умолчанию это системный
+`camera-shutter.oga`; путь можно заменить на любой OGG/WAV. Используется
 `paplay`, затем `pw-play`, затем `canberra-gtk-play`; если все недоступны,
 звук отключается с предупреждением.
 
