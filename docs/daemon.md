@@ -31,6 +31,12 @@ cargo run -p layoutpilot-daemon -- run
 evdev-capture можно включить через `[capture] backend = "evdev"`; для этого
 нужен доступ к `/dev/input/event*`.
 
+На Wayland при `inject.request_permission_on_start = true` демон при старте
+делает один Shift-tap, чтобы KDE показал запрос на управление вводом сразу,
+а не в момент первой коррекции. Это не текст и не меню; если запрос не нужен,
+поставьте `false`. В `--dry-run` preflight не выполняется. Если в разрешении
+отказано, инъекция не сработает.
+
 ## Что делает демон
 
 1. Выбранный capture-backend (`xrecord` или `evdev`) приносит key-события.

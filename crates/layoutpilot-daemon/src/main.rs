@@ -226,8 +226,14 @@ struct Daemon {
 
 impl Daemon {
     fn new(dry_run: bool, config: Config) -> Result<Self, Box<dyn Error>> {
+        let mut injector = open_injector(&config)?;
+        if config.inject.request_permission_on_start && !dry_run && is_wayland_session() {
+            println!("layoutpilot: requesting input-injection permission (Shift tap)");
+            if let Err(error) = injector.request_input_permission() {
+                eprintln!("layoutpilot: permission request failed: {error}");
+            }
+        }
         let capture = open_capture(&config)?;
-        let injector = open_injector(&config)?;
         let layout_order = config.layout_order();
         let layouts = match config.layout.backend {
             LayoutBackend::Auto | LayoutBackend::X11 => X11LayoutState::new(layout_order)?,
@@ -563,6 +569,11 @@ impl Daemon {
             }
         }
     }
+}
+
+fn is_wayland_session() -> bool {
+    env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland"))
+        || env::var_os("WAYLAND_DISPLAY").is_some()
 }
 
 fn setup_hotkey_grabber(hotkeys: &Hotkeys) -> (Option<X11HotkeyGrabber>, HashSet<HotkeyAction>) {

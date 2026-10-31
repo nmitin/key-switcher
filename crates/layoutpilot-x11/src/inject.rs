@@ -79,6 +79,19 @@ impl X11Injector {
         Ok(())
     }
 
+    /// Trigger the compositor's input-injection permission prompt.
+    ///
+    /// A single Shift press/release is used: it does not produce text or open a
+    /// menu, but it is a real XTest key event, so KDE's XWayland permission
+    /// gate can ask the user once at daemon startup instead of during typing.
+    /// The event is recorded and then cleared so own-event suppression is not
+    /// polluted.
+    pub fn request_input_permission(&mut self) -> Result<(), X11Error> {
+        self.tap_keycode(SHIFT_KEYCODE, false)?;
+        self.clear_sent_events();
+        Ok(())
+    }
+
     /// Press Backspace `count` times.
     pub fn tap_backspace(&mut self, count: usize) -> Result<(), X11Error> {
         for _ in 0..count {

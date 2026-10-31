@@ -29,6 +29,7 @@ llm_suggest = true
 backend = "auto"                   # auto | xtest | eis | virtual-keyboard | uinput | clipboard
 allow_uinput_in_games = false
 restore_clipboard = true
+request_permission_on_start = true   # Wayland: one Shift tap triggers the XTest permission prompt
 
 [layout]
 backend = "auto"                   # auto | kde | gnome | sway | hyprland | x11

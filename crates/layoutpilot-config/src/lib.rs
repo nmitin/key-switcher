@@ -279,6 +279,9 @@ pub struct InjectConfig {
     pub allow_uinput_in_games: bool,
     /// Restore clipboard after paste.
     pub restore_clipboard: bool,
+    /// Ask the compositor for input-injection permission at startup by
+    /// sending a harmless Shift tap. Only used on Wayland.
+    pub request_permission_on_start: bool,
 }
 
 impl Default for InjectConfig {
@@ -287,6 +290,7 @@ impl Default for InjectConfig {
             backend: InjectBackend::Auto,
             allow_uinput_in_games: false,
             restore_clipboard: true,
+            request_permission_on_start: true,
         }
     }
 }
@@ -565,6 +569,7 @@ mod tests {
         assert!((config.general.confidence_threshold - 0.97).abs() < f32::EPSILON);
         assert_eq!(config.capture.backend, CaptureBackend::Auto);
         assert_eq!(config.inject.backend, InjectBackend::Auto);
+        assert!(config.inject.request_permission_on_start);
         assert_eq!(config.layout.backend, LayoutBackend::Auto);
         assert_eq!(config.layout.order, vec![LayoutCode::Us, LayoutCode::Ru]);
         assert!(!config.privacy.store_keystrokes);
