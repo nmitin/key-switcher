@@ -539,6 +539,7 @@ dependencies = [
  "layoutpilot-dict",
  "layoutpilot-inject",
  "layoutpilot-x11",
+ "zbus",
 ]
 
 [[package]]

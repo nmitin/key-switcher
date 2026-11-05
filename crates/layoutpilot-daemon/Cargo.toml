@@ -14,6 +14,7 @@ layoutpilot-capture = { path = "../layoutpilot-capture" }
 layoutpilot-dict = { path = "../layoutpilot-dict" }
 layoutpilot-inject = { path = "../layoutpilot-inject" }
 layoutpilot-x11 = { path = "../layoutpilot-x11" }
+zbus = "4"
 
 [[bin]]
 name = "layoutpilot"

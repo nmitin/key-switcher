@@ -433,7 +433,16 @@ impl Default for Config {
 
 fn default_apps() -> BTreeMap<String, AppConfig> {
     let mut apps = BTreeMap::new();
-    for pattern in ["*terminal*", "*konsole*", "*alacritty*", "*kitty*"] {
+    for pattern in [
+        "*terminal*",
+        "*konsole*",
+        "*yakuake*",
+        "*alacritty*",
+        "*kitty*",
+        "*wezterm*",
+        "*foot*",
+        "*xterm*",
+    ] {
         apps.insert(
             pattern.to_owned(),
             AppConfig {

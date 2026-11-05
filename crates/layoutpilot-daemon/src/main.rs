@@ -7,6 +7,8 @@
 //! The daemon loads `~/.config/layoutpilot/config.toml` (or `--config PATH`)
 //! and falls back to built-in defaults.
 
+mod kde_focus;
+
 use std::collections::{HashSet, VecDeque};
 use std::env;
 use std::error::Error;
@@ -458,6 +460,7 @@ struct Daemon {
     layouts: LayoutController,
     sound: SoundPlayer,
     focus: X11Focus,
+    kde_focus: Option<kde_focus::KdeFocus>,
     manager: CorrectionManager<DictionaryDetector>,
     resolver: ProfileResolver,
     hotkeys: Hotkeys,
@@ -504,6 +507,20 @@ impl Daemon {
         let (hotkey_grabber, grabbed_hotkeys) = setup_hotkey_grabber(&hotkeys);
         let resolver = config.to_profile_resolver();
         let profile = resolver.resolve("");
+        let kde_focus = if is_kde_session() && is_wayland_session() {
+            match kde_focus::KdeFocus::start() {
+                Ok(focus) => {
+                    println!("layoutpilot: KDE focus via KWin script");
+                    Some(focus)
+                }
+                Err(error) => {
+                    eprintln!("layoutpilot: KDE focus unavailable: {error}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let idle_timeout = Duration::from_millis(config.privacy.buffer_idle_timeout_ms.max(1));
         let clear_on_focus_change = config.privacy.clear_on_focus_change;
 
@@ -520,6 +537,7 @@ impl Daemon {
             layouts,
             sound,
             focus,
+            kde_focus,
             resolver,
             active_layout,
             profile,
@@ -973,31 +991,30 @@ impl Daemon {
         }
         self.last_focus_poll = Instant::now();
 
-        match self.focus.snapshot() {
-            Ok(info) => {
-                let window_changed = self.window != Some(info.window);
-                let app_changed = self.app_id != info.app_id;
-                self.window = Some(info.window);
-                self.app_id = info.app_id;
-                self.profile = self.resolver.resolve(self.app_id.as_deref().unwrap_or(""));
-                if window_changed || app_changed {
-                    println!(
-                        "layoutpilot: focus window={:#x}, app={:?}, profile={:?}",
-                        info.window, self.app_id, self.profile
-                    );
-                    if self.clear_on_focus_change {
-                        self.manager.reset(ResetReason::FocusChange);
-                    }
-                }
-            }
-            Err(_) => {
-                if self.window.take().is_some() {
-                    self.app_id = None;
-                    self.profile = Profile::Auto;
-                    if self.clear_on_focus_change {
-                        self.manager.reset(ResetReason::FocusChange);
-                    }
-                }
+        let (window, mut app_id) = match self.focus.snapshot() {
+            Ok(info) => (Some(info.window), info.app_id),
+            Err(_) => (None, None),
+        };
+        // Native Wayland windows are invisible to X11Focus; KWin reports their
+        // resource class through the loaded script.
+        if app_id.is_none() {
+            app_id = self
+                .kde_focus
+                .as_ref()
+                .and_then(kde_focus::KdeFocus::app_id);
+        }
+        let window_changed = self.window != window;
+        let app_changed = self.app_id != app_id;
+        self.window = window;
+        self.app_id = app_id;
+        self.profile = self.resolver.resolve(self.app_id.as_deref().unwrap_or(""));
+        if window_changed || app_changed {
+            println!(
+                "layoutpilot: focus window={:?}, app={:?}, profile={:?}",
+                self.window, self.app_id, self.profile
+            );
+            if self.clear_on_focus_change {
+                self.manager.reset(ResetReason::FocusChange);
             }
         }
     }

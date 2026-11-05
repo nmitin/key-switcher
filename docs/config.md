@@ -60,7 +60,7 @@ mode = "auto"
 ```
 
 Порядок: точное имя → glob по убыванию специфичности → `*`.
-`*terminal*`, `*konsole*`, `*alacritty*`, `*kitty*` по умолчанию `manual`,
+`*terminal*`, `*konsole*`, `*yakuake*`, `*alacritty*`, `*kitty*` по умолчанию `manual`,
 `*keepass*` — `off`.
 
 ## Хоткеи
