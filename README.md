@@ -156,6 +156,18 @@ sudo udevadm control --reload-rules && sudo udevadm trigger
 После этого `layoutpilot doctor` должен показать `uinput: ok` и
 `capture: ok (evdev)`. На X11 достаточно `DISPLAY` и XTest.
 
+Автозапуск в графической сессии:
+
+```sh
+cargo build --release -p layoutpilot-daemon
+install -Dm755 target/release/layoutpilot ~/.local/bin/layoutpilot
+install -Dm644 packaging/layoutpilot.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now layoutpilot.service
+```
+
+Подробнее — [`packaging/README.md`](packaging/README.md).
+
 ## Структура
 
 ```
@@ -171,6 +183,8 @@ crates/
   layoutpilot-daemon/    бинарник layoutpilot: capture → engine → inject
 packaging/
   60-layoutpilot.rules   udev uaccess для /dev/input и /dev/uinput
+  layoutpilot.service    systemd user unit для автозапуска
+  README.md              установка, udev и автозапуск
 config.example.toml      пример конфигурации
 data/
   xkb/                   сгенерированные таблицы и их происхождение

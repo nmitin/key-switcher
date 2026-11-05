@@ -156,6 +156,23 @@ capture: FAIL (/dev/input does not exist)
 После установки udev-правила и появления доступа к `/dev/input` и `/dev/uinput`
 обе строки должны стать `ok`.
 
+## Автозапуск
+
+Готовый unit лежит в [`packaging/layoutpilot.service`](../packaging/layoutpilot.service).
+Он запускается после `graphical-session.target` и перезапускается при падении.
+Бинарник должен быть установлен в `~/.local/bin/layoutpilot`; если путь другой,
+поправь `ExecStart`.
+
+```sh
+install -Dm644 packaging/layoutpilot.service ~/.config/systemd/user/layoutpilot.service
+systemctl --user daemon-reload
+systemctl --user enable --now layoutpilot.service
+systemctl --user status layoutpilot.service
+journalctl --user -u layoutpilot.service -f
+```
+
+После правки конфига: `systemctl --user restart layoutpilot.service`.
+
 ## Ограничения
 
 - Layout state опрашивается на каждое нажатие, а не через события

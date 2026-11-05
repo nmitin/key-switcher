@@ -1,0 +1,27 @@
+[Unit]
+Description=LayoutPilot keyboard layout corrector
+Documentation=https://github.com/nmitin/key-switcher
+After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/layoutpilot run
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=layoutpilot
+RuntimeDirectoryMode=0700
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t/layoutpilot
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=graphical-session.target
