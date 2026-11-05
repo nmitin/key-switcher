@@ -1,12 +1,11 @@
-//! `layoutpilot` daemon for the X11 vertical slice.
+//! `layoutpilot` daemon.
 //!
-//! Data flow: XRecord key events → XKB layout lookup → character
-//! normalization → `CorrectionManager` (engine + dictionaries) → XTest
-//! injection with an XKB group switch.
+//! Data flow: XRecord/evdev key events → layout lookup → character
+//! normalization → `CorrectionManager` (engine + dictionaries) → injection
+//! (XTest on X11, uinput on Wayland) with a compositor layout switch.
 //!
 //! The daemon loads `~/.config/layoutpilot/config.toml` (or `--config PATH`)
-//! and falls back to built-in defaults. Hot reload, global hotkeys, tray and
-//! evdev capture are not wired yet.
+//! and falls back to built-in defaults.
 
 use std::collections::{HashSet, VecDeque};
 use std::env;
@@ -17,13 +16,16 @@ use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
 use layoutpilot_capture::{EvdevCapture, EvdevKeyEvent};
-use layoutpilot_compositor::KdeLayouts;
-use layoutpilot_config::{CaptureBackend, Config, Hotkey, InjectBackend, LayoutBackend, Trigger};
+use layoutpilot_compositor::{HyprlandLayouts, KdeLayouts, SwayLayouts};
+use layoutpilot_config::{
+    CaptureBackend, Config, DeleteMode, Hotkey, InjectBackend, LayoutBackend, Trigger,
+};
 use layoutpilot_core::{
-    CorrectionManager, CorrectionPlan, InputContext, LayoutId, Profile, ProfileResolver,
-    ResetReason,
+    CorrectionManager, CorrectionPlan, InputContext, LayoutId, LayoutTable, Profile,
+    ProfileResolver, ResetReason,
 };
 use layoutpilot_dict::{DictionaryDetector, Language};
+use layoutpilot_inject::UinputInjector;
 use layoutpilot_x11::{
     char_for, modifiers, KeyEvent, X11Focus, X11HotkeyGrabber, X11Injector, X11LayoutState,
     XRecordCapture,
@@ -32,6 +34,7 @@ use layoutpilot_x11::{
 const BACKSPACE_KEYCODE: u8 = 22;
 const RETURN_KEYCODE: u8 = 36;
 const TAB_KEYCODE: u8 = 23;
+const SPACE_KEYCODE: u8 = 65;
 const ESCAPE_KEYCODE: u8 = 9;
 const IGNORE_WINDOW: Duration = Duration::from_millis(750);
 
@@ -84,6 +87,70 @@ impl Hotkeys {
         } else {
             None
         }
+    }
+}
+
+/// XKB keycodes for left and right Shift.
+const SHIFT_KEYCODES: [u8; 2] = [50, 62];
+
+/// Double Shift fixes the last word; any other key breaks the sequence.
+#[derive(Debug)]
+struct ShiftGesture {
+    count: u8,
+    last_press: Option<Instant>,
+    broken: bool,
+    window: Duration,
+}
+
+impl Default for ShiftGesture {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            last_press: None,
+            broken: false,
+            window: Duration::from_millis(400),
+        }
+    }
+}
+
+impl ShiftGesture {
+    fn reset(&mut self) {
+        self.count = 0;
+        self.last_press = None;
+        self.broken = false;
+    }
+
+    /// Feed one key event; returns true when the second Shift is released.
+    fn on_key(&mut self, keycode: u8, pressed: bool, now: Instant) -> bool {
+        if SHIFT_KEYCODES.contains(&keycode) {
+            if pressed {
+                self.count = if self
+                    .last_press
+                    .is_some_and(|last| now.duration_since(last) <= self.window)
+                {
+                    self.count.saturating_add(1)
+                } else {
+                    1
+                };
+                self.last_press = Some(now);
+                self.broken = false;
+            } else if self.broken {
+                self.reset();
+            } else if self.count == 2 {
+                self.reset();
+                return true;
+            } else if self.count >= 3 {
+                // Phrases are not implemented yet; do not let a third tap
+                // leave the counter in a state where it fires later.
+                self.reset();
+            }
+            return false;
+        }
+        if pressed {
+            self.reset();
+            self.broken = true;
+        }
+        false
     }
 }
 
@@ -170,6 +237,8 @@ enum LayoutController {
         kde: KdeLayouts,
         xkb: Option<X11LayoutState>,
     },
+    Sway(SwayLayouts),
+    Hyprland(HyprlandLayouts),
 }
 
 impl LayoutController {
@@ -177,6 +246,8 @@ impl LayoutController {
         match self {
             Self::X11(_) => "x11-xkb",
             Self::Kde { .. } => "kde-dbus+xkb",
+            Self::Sway(_) => "sway-ipc",
+            Self::Hyprland(_) => "hyprland-ipc",
         }
     }
 
@@ -184,10 +255,12 @@ impl LayoutController {
         match self {
             Self::X11(state) => Ok(state.active_layout()?),
             Self::Kde { kde, .. } => Ok(kde.current()?),
+            Self::Sway(sway) => Ok(sway.current()?),
+            Self::Hyprland(hyprland) => Ok(hyprland.current()?),
         }
     }
 
-    fn switch_to(&self, layout: LayoutId) -> Result<(), Box<dyn Error>> {
+    fn switch_to(&mut self, layout: LayoutId) -> Result<(), Box<dyn Error>> {
         match self {
             Self::X11(state) => {
                 state.switch_to(layout)?;
@@ -200,6 +273,8 @@ impl LayoutController {
                     }
                 }
             }
+            Self::Sway(sway) => sway.switch_to(layout)?,
+            Self::Hyprland(hyprland) => hyprland.switch_to(layout)?,
         }
         Ok(())
     }
@@ -208,7 +283,15 @@ impl LayoutController {
         match self {
             Self::X11(state) => state.layouts().contains(&layout),
             Self::Kde { kde, .. } => kde.supports(layout),
+            Self::Sway(sway) => sway.supports(layout),
+            Self::Hyprland(hyprland) => hyprland.supports(layout),
         }
+    }
+
+    fn always_switch(&self) -> bool {
+        // Sway/Hyprland keep a layout per keyboard; our uinput device may have
+        // stayed in another group even when the tracked layout looks unchanged.
+        matches!(self, Self::Sway(_) | Self::Hyprland(_))
     }
 
     fn sync_xkb(&self, layout: LayoutId) {
@@ -216,6 +299,59 @@ impl LayoutController {
             if let Err(error) = xkb.switch_to(layout) {
                 eprintln!("layoutpilot: cannot sync XKB group: {error}");
             }
+        }
+    }
+}
+
+/// Injection backend selected at startup.
+enum Injector {
+    X11(Box<X11Injector>),
+    Uinput(UinputInjector),
+}
+
+impl Injector {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::X11(_) => "xtest",
+            Self::Uinput(_) => "uinput",
+        }
+    }
+
+    fn tap_backspace(&mut self, count: usize) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::X11(injector) => Ok(injector.tap_backspace(count)?),
+            Self::Uinput(injector) => Ok(injector.tap_backspace(count)?),
+        }
+    }
+
+    fn tap_ctrl_backspace(&mut self) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::X11(injector) => Ok(injector.tap_ctrl_backspace()?),
+            Self::Uinput(injector) => Ok(injector.tap_ctrl_backspace()?),
+        }
+    }
+
+    fn tap_text(&mut self, text: &str, layout: &LayoutTable) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::X11(injector) => Ok(injector.tap_text(text, layout)?),
+            Self::Uinput(injector) => Ok(injector.tap_text(text, layout)?),
+        }
+    }
+
+    fn request_input_permission(&mut self) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::X11(injector) => Ok(injector.request_input_permission()?),
+            Self::Uinput(injector) => Ok(injector.request_input_permission()?),
+        }
+    }
+
+    fn take_sent_events(&mut self) -> Vec<(u8, bool)> {
+        match self {
+            Self::X11(injector) => injector.take_sent_events(),
+            // uinput events are filtered by device name, not by keycode:
+            // putting them in the XTest journal could swallow a real key with
+            // the same code pressed shortly after the correction.
+            Self::Uinput(_) => Vec::new(),
         }
     }
 }
@@ -318,7 +454,7 @@ impl Capture {
 struct Daemon {
     config: Config,
     capture: Capture,
-    injector: X11Injector,
+    injector: Injector,
     layouts: LayoutController,
     sound: SoundPlayer,
     focus: X11Focus,
@@ -340,8 +476,10 @@ struct Daemon {
     ignore: VecDeque<(u8, bool)>,
     ignore_until: Instant,
     pending_enter: bool,
+    pending_space: bool,
     enter_ignore_until: Instant,
     evdev_modifiers: EvdevModifiers,
+    shift_gesture: ShiftGesture,
     dry_run: bool,
 }
 
@@ -394,8 +532,10 @@ impl Daemon {
             ignore: VecDeque::new(),
             ignore_until: Instant::now(),
             pending_enter: false,
+            pending_space: false,
             enter_ignore_until: Instant::now(),
             evdev_modifiers: EvdevModifiers::default(),
+            shift_gesture: ShiftGesture::default(),
             dry_run,
         };
         daemon.refresh_focus(true);
@@ -404,9 +544,10 @@ impl Daemon {
 
     fn run(mut self) -> Result<(), Box<dyn Error>> {
         println!(
-            "layoutpilot: capture={} ({}), layout={} ({:?}), dry_run={}, app={:?}",
+            "layoutpilot: capture={} ({}), inject={}, layout={} ({:?}), dry_run={}, app={:?}",
             self.capture.backend_name(),
             config_backend_name(self.config.capture.backend),
+            self.injector.name(),
             self.layouts.name(),
             self.active_layout,
             self.dry_run,
@@ -453,12 +594,15 @@ impl Daemon {
     }
 
     fn handle_evdev(&mut self, event: EvdevKeyEvent) -> Result<(), Box<dyn Error>> {
+        if event.device == layoutpilot_core::VIRTUAL_KEYBOARD_NAME {
+            // Own uinput output. Capture normally filters the device out, but
+            // this also protects against a device opened before injection.
+            return Ok(());
+        }
         let Some(evdev_keycode) = event.keycode.checked_sub(8) else {
             return Ok(());
         };
-        if self.evdev_modifiers.update(evdev_keycode, event.value) {
-            return Ok(());
-        }
+        let modifier = self.evdev_modifiers.update(evdev_keycode, event.value);
         let Ok(keycode) = u8::try_from(event.keycode) else {
             return Ok(());
         };
@@ -468,6 +612,19 @@ impl Daemon {
             time: 0,
             pressed: event.pressed(),
         };
+        if modifier {
+            // Modifiers never reach handle_key, so feed the Shift gesture here.
+            if self.paused {
+                self.shift_gesture.reset();
+            } else if self.config.general.double_shift_fix
+                && self
+                    .shift_gesture
+                    .on_key(keycode, event.pressed(), Instant::now())
+            {
+                self.manual_fix(&x11_event)?;
+            }
+            return Ok(());
+        }
         self.handle_key(x11_event)
     }
 
@@ -482,9 +639,24 @@ impl Daemon {
             return Ok(());
         }
         if !event.pressed {
+            if self.config.general.double_shift_fix
+                && !self.paused
+                && self
+                    .shift_gesture
+                    .on_key(event.keycode, false, Instant::now())
+            {
+                self.manual_fix(&event)?;
+                return Ok(());
+            }
             if event.keycode == RETURN_KEYCODE && self.pending_enter {
                 self.pending_enter = false;
                 self.handle_char('\n', &event)?;
+            } else if event.keycode == SPACE_KEYCODE && self.pending_space {
+                // Trigger on release: by now the application has processed
+                // the separator, so the plan's trailing-space Backspace hits
+                // the real space instead of the previous word's separator.
+                self.pending_space = false;
+                self.handle_char(' ', &event)?;
             }
             return Ok(());
         }
@@ -497,6 +669,24 @@ impl Daemon {
             return Ok(());
         }
         if self.paused {
+            self.shift_gesture.reset();
+            return Ok(());
+        }
+
+        if self.config.general.double_shift_fix {
+            let _ = self
+                .shift_gesture
+                .on_key(event.keycode, true, Instant::now());
+        }
+
+        if self.pending_space && event.keycode != SPACE_KEYCODE {
+            // A key arrived before the space release: preserve input order.
+            self.pending_space = false;
+            self.handle_char(' ', &event)?;
+        }
+        if event.keycode == SPACE_KEYCODE && self.config.general.triggers.contains(&Trigger::Space)
+        {
+            self.pending_space = true;
             return Ok(());
         }
 
@@ -558,6 +748,22 @@ impl Daemon {
                 };
                 self.handle_hotkey(action, &key)?;
             }
+        }
+        Ok(())
+    }
+
+    fn manual_fix(&mut self, event: &KeyEvent) -> Result<(), Box<dyn Error>> {
+        if self.manager.undo_applied() {
+            if let Some(plan) = self.manager.undo() {
+                self.apply(plan)?;
+                return Ok(());
+            }
+        }
+        let app_id = self.app_id.clone();
+        let context = self.context(event, app_id.as_deref());
+        match self.manager.on_fix_last_word(&context) {
+            Some(plan) => self.apply(plan)?,
+            None => println!("layoutpilot: no word to fix"),
         }
         Ok(())
     }
@@ -629,6 +835,35 @@ impl Daemon {
         context
     }
 
+    fn layout_settle_delay(&self) -> Duration {
+        // uinput events go through the kernel and the compositor's keymap;
+        // 20 ms is enough for XTest but can lose the first character on
+        // Wayland. Keep a floor without changing the configured value for X11.
+        let floor = if matches!(&self.injector, Injector::Uinput(_)) {
+            100
+        } else {
+            0
+        };
+        Duration::from_millis(self.config.inject.layout_settle_ms.max(floor))
+    }
+
+    fn pre_inject_delay(&self) -> Option<Duration> {
+        // evdev gives us the trigger before the compositor has necessarily
+        // delivered the word to the focused client. Without this pause uinput
+        // can type the replacement at the document start and the physical
+        // word arrives afterwards ("приветghbdtn"). XTest is ordered by the
+        // X server, so the delay is only needed for uinput.
+        if matches!(&self.injector, Injector::Uinput(_))
+            && self.config.inject.pre_inject_delay_ms > 0
+        {
+            Some(Duration::from_millis(
+                self.config.inject.pre_inject_delay_ms,
+            ))
+        } else {
+            None
+        }
+    }
+
     fn apply(&mut self, plan: CorrectionPlan) -> Result<(), Box<dyn Error>> {
         if self.dry_run {
             println!(
@@ -656,12 +891,21 @@ impl Daemon {
         }
 
         let previous_layout = self.active_layout;
+        if let Some(delay) = self.pre_inject_delay() {
+            std::thread::sleep(delay);
+        }
         // Delete first, while the old layout is still active: switching the
         // layout reloads the XWayland keymap and can swallow one Backspace.
-        self.injector.tap_backspace(plan.backspaces)?;
+        match self.config.inject.delete_mode {
+            DeleteMode::Backspace => self.injector.tap_backspace(plan.backspaces)?,
+            DeleteMode::CtrlBackspace if plan.backspaces > 0 => {
+                self.injector.tap_ctrl_backspace()?;
+            }
+            DeleteMode::CtrlBackspace => {}
+        }
         self.layouts.switch_to(plan.layout)?;
-        if previous_layout != Some(plan.layout) {
-            std::thread::sleep(Duration::from_millis(self.config.inject.layout_settle_ms));
+        if previous_layout != Some(plan.layout) || self.layouts.always_switch() {
+            std::thread::sleep(self.layout_settle_delay());
         }
         self.injector.tap_text(&plan.text, plan.layout.table())?;
         if let Some(separator) = plan.separator {
@@ -766,6 +1010,14 @@ fn is_wayland_session() -> bool {
 
 fn setup_hotkey_grabber(hotkeys: &Hotkeys) -> (Option<X11HotkeyGrabber>, HashSet<HotkeyAction>) {
     let mut grabbed = HashSet::new();
+    if is_wayland_session() {
+        // XGrabKey talks to XWayland, but native Wayland clients never deliver
+        // those grabs. If we treated the grab as active, handle_key would skip
+        // passive matching and the hotkey would do nothing at all. Match them
+        // in the evdev stream instead; the focused app may also see the key.
+        println!("layoutpilot: Wayland: hotkeys are passive (evdev)");
+        return (None, grabbed);
+    }
     if env::var_os("DISPLAY").is_none() {
         return (None, grabbed);
     }
@@ -808,10 +1060,28 @@ fn is_kde_session() -> bool {
         || env::var_os("KDE_FULL_SESSION").is_some()
 }
 
+fn is_sway_session() -> bool {
+    env::var_os("SWAYSOCK").is_some()
+        || env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_uppercase()
+            .contains("SWAY")
+}
+
+fn is_hyprland_session() -> bool {
+    env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+        || env::var("XDG_CURRENT_DESKTOP")
+            .unwrap_or_default()
+            .to_ascii_uppercase()
+            .contains("HYPRLAND")
+}
+
 fn open_layouts(config: &Config) -> Result<LayoutController, Box<dyn Error>> {
     let requested = config.layout.backend;
     let backend = match requested {
         LayoutBackend::Auto if is_kde_session() => LayoutBackend::Kde,
+        LayoutBackend::Auto if is_sway_session() => LayoutBackend::Sway,
+        LayoutBackend::Auto if is_hyprland_session() => LayoutBackend::Hyprland,
         LayoutBackend::Auto => LayoutBackend::X11,
         backend => backend,
     };
@@ -840,6 +1110,8 @@ fn open_layouts(config: &Config) -> Result<LayoutController, Box<dyn Error>> {
             }
             Err(error) => Err(error.into()),
         },
+        LayoutBackend::Sway => Ok(LayoutController::Sway(SwayLayouts::new()?)),
+        LayoutBackend::Hyprland => Ok(LayoutController::Hyprland(HyprlandLayouts::new()?)),
         LayoutBackend::X11 => Ok(LayoutController::X11(X11LayoutState::new(
             config.layout_order(),
         )?)),
@@ -849,6 +1121,9 @@ fn open_layouts(config: &Config) -> Result<LayoutController, Box<dyn Error>> {
 
 fn open_capture(config: &Config) -> Result<Capture, Box<dyn Error>> {
     let backend = match config.capture.backend {
+        // On Wayland DISPLAY usually points at XWayland, whose XRecord only
+        // sees XWayland clients. Native Wayland needs evdev.
+        CaptureBackend::Auto if is_wayland_session() => CaptureBackend::Evdev,
         CaptureBackend::Auto if env::var_os("DISPLAY").is_some() => CaptureBackend::Xrecord,
         CaptureBackend::Auto => CaptureBackend::Evdev,
         backend => backend,
@@ -873,9 +1148,21 @@ fn config_backend_name(backend: CaptureBackend) -> &'static str {
     }
 }
 
-fn open_injector(config: &Config) -> Result<X11Injector, Box<dyn Error>> {
+fn open_injector(config: &Config) -> Result<Injector, Box<dyn Error>> {
     match config.inject.backend {
-        InjectBackend::Auto | InjectBackend::Xtest => Ok(X11Injector::new()?),
+        InjectBackend::Auto if is_wayland_session() => match UinputInjector::new() {
+            Ok(injector) => Ok(Injector::Uinput(injector)),
+            Err(error) => {
+                eprintln!(
+                    "layoutpilot: uinput unavailable ({error}); falling back to XTest/XWayland"
+                );
+                Ok(Injector::X11(Box::new(X11Injector::new()?)))
+            }
+        },
+        InjectBackend::Auto | InjectBackend::Xtest => {
+            Ok(Injector::X11(Box::new(X11Injector::new()?)))
+        }
+        InjectBackend::Uinput => Ok(Injector::Uinput(UinputInjector::new()?)),
         other => Err(format!("inject backend {other:?} is not wired yet").into()),
     }
 }
@@ -890,8 +1177,10 @@ fn load_config(explicit: Option<PathBuf>) -> Result<(Config, Option<PathBuf>), B
 
 fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>> {
     let mut failures = 0;
+    let wayland = is_wayland_session();
 
     println!("LayoutPilot doctor");
+    println!("session: {}", if wayland { "wayland" } else { "x11" });
     println!("DISPLAY: {:?}", env::var("DISPLAY").ok());
     match path {
         Some(path) => println!("config: {}", path.display()),
@@ -918,42 +1207,55 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
         }
     );
     println!(
-        "inject delays: layout_settle_ms={}, separator_delay_ms={}",
-        config.inject.layout_settle_ms, config.inject.separator_delay_ms
+        "inject: delete_mode={:?}, pre_inject_delay_ms={}, layout_settle_ms={}, separator_delay_ms={}",
+        config.inject.delete_mode,
+        config.inject.pre_inject_delay_ms,
+        config.inject.layout_settle_ms,
+        config.inject.separator_delay_ms
     );
 
-    match X11HotkeyGrabber::new() {
-        Ok(mut grabber) => {
-            println!("XGrabKey: ok");
-            grabber.ungrab_all();
-        }
-        Err(error) => {
-            failures += 1;
-            println!("XGrabKey: FAIL ({error})");
-        }
-    }
-
-    match X11Injector::new() {
-        Ok(_) => println!("XTEST: ok"),
-        Err(error) => {
-            failures += 1;
-            println!("XTEST: FAIL ({error})");
-        }
-    }
-
-    match X11LayoutState::new(config.layout_order()) {
-        Ok(layouts) => match (layouts.group(), layouts.active_layout()) {
-            (Ok(group), Ok(active)) => {
-                println!("XKB: ok (group {group}, active {active:?})");
+    if wayland {
+        match UinputInjector::new() {
+            Ok(_) => println!("uinput: ok"),
+            Err(error) => {
+                failures += 1;
+                println!("uinput: FAIL ({error})");
             }
-            (Err(error), _) | (_, Err(error)) => {
+        }
+    } else {
+        match X11HotkeyGrabber::new() {
+            Ok(mut grabber) => {
+                println!("XGrabKey: ok");
+                grabber.ungrab_all();
+            }
+            Err(error) => {
+                failures += 1;
+                println!("XGrabKey: FAIL ({error})");
+            }
+        }
+
+        match X11Injector::new() {
+            Ok(_) => println!("XTEST: ok"),
+            Err(error) => {
+                failures += 1;
+                println!("XTEST: FAIL ({error})");
+            }
+        }
+
+        match X11LayoutState::new(config.layout_order()) {
+            Ok(layouts) => match (layouts.group(), layouts.active_layout()) {
+                (Ok(group), Ok(active)) => {
+                    println!("XKB: ok (group {group}, active {active:?})");
+                }
+                (Err(error), _) | (_, Err(error)) => {
+                    failures += 1;
+                    println!("XKB: FAIL ({error})");
+                }
+            },
+            Err(error) => {
                 failures += 1;
                 println!("XKB: FAIL ({error})");
             }
-        },
-        Err(error) => {
-            failures += 1;
-            println!("XKB: FAIL ({error})");
         }
     }
 
@@ -975,6 +1277,44 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
             Err(error) => {
                 failures += 1;
                 println!("KDE layouts: FAIL ({error})");
+            }
+        }
+    }
+
+    if is_sway_session() {
+        match SwayLayouts::new() {
+            Ok(sway) => match sway.current() {
+                Ok(current) => println!(
+                    "Sway layouts: ok (current={current:?}, list={:?})",
+                    sway.layouts()
+                ),
+                Err(error) => {
+                    failures += 1;
+                    println!("Sway layouts: FAIL ({error})");
+                }
+            },
+            Err(error) => {
+                failures += 1;
+                println!("Sway layouts: FAIL ({error})");
+            }
+        }
+    }
+
+    if is_hyprland_session() {
+        match HyprlandLayouts::new() {
+            Ok(hyprland) => match hyprland.current() {
+                Ok(current) => println!(
+                    "Hyprland layouts: ok (current={current:?}, list={:?})",
+                    hyprland.layouts()
+                ),
+                Err(error) => {
+                    failures += 1;
+                    println!("Hyprland layouts: FAIL ({error})");
+                }
+            },
+            Err(error) => {
+                failures += 1;
+                println!("Hyprland layouts: FAIL ({error})");
             }
         }
     }
@@ -1138,20 +1478,39 @@ mod tests {
         let hotkeys = Hotkeys::from_config(&Config::default()).unwrap();
         assert_eq!(hotkeys.action(127, 0), Some(HotkeyAction::Undo));
         assert_eq!(
-            hotkeys.action(
-                41,
-                layoutpilot_config::hotkey::MOD_CONTROL | layoutpilot_config::hotkey::MOD_SHIFT
-            ),
+            hotkeys.action(74, layoutpilot_config::hotkey::MOD_CONTROL),
             Some(HotkeyAction::Fix)
         );
         assert_eq!(
-            hotkeys.action(
-                33,
-                layoutpilot_config::hotkey::MOD_CONTROL | layoutpilot_config::hotkey::MOD_SHIFT
-            ),
+            hotkeys.action(75, layoutpilot_config::hotkey::MOD_CONTROL),
             Some(HotkeyAction::Pause)
         );
-        assert_eq!(hotkeys.action(41, 0), None);
+        assert_eq!(hotkeys.action(74, 0), None);
+    }
+
+    #[test]
+    fn double_shift_gesture_fires_and_resets() {
+        let start = Instant::now();
+        let mut gesture = ShiftGesture::default();
+        assert!(!gesture.on_key(50, true, start));
+        assert!(!gesture.on_key(50, false, start + Duration::from_millis(20)));
+        assert!(!gesture.on_key(50, true, start + Duration::from_millis(40)));
+        assert!(gesture.on_key(50, false, start + Duration::from_millis(60)));
+        // The sequence is consumed, a third tap alone must not fire.
+        assert!(!gesture.on_key(50, true, start + Duration::from_millis(80)));
+        assert!(!gesture.on_key(50, false, start + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn double_shift_gesture_breaks_on_other_key() {
+        let start = Instant::now();
+        let mut gesture = ShiftGesture::default();
+        assert!(!gesture.on_key(50, true, start));
+        assert!(!gesture.on_key(50, false, start + Duration::from_millis(20)));
+        assert!(!gesture.on_key(38, true, start + Duration::from_millis(30)));
+        assert!(!gesture.on_key(38, false, start + Duration::from_millis(40)));
+        assert!(!gesture.on_key(50, true, start + Duration::from_millis(50)));
+        assert!(!gesture.on_key(50, false, start + Duration::from_millis(60)));
     }
 
     #[test]

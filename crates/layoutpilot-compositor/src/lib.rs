@@ -2,20 +2,58 @@
 //!
 //! KDE Plasma exposes the active layout through the session bus:
 //! `org.kde.keyboard` → `/Layouts` → `org.kde.KeyboardLayouts`.
-//! This is the Wayland-safe path; locking an XKB group on XWayland does not
-//! update KDE's own layout indicator.
+//! Sway and Hyprland expose it through their IPC sockets.
+//! These are the Wayland-safe paths; locking an XKB group on XWayland does not
+//! update the compositor's own layout indicator.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
+
+mod hyprland;
+mod sway;
 
 use std::fmt;
 
 use layoutpilot_core::LayoutId;
 use zbus::blocking::{Connection, Proxy};
 
+pub use hyprland::{HyprlandError, HyprlandLayouts};
+pub use sway::{SwayError, SwayLayouts};
+
 const KDE_SERVICE: &str = "org.kde.keyboard";
 const KDE_PATH: &str = "/Layouts";
 const KDE_INTERFACE: &str = "org.kde.KeyboardLayouts";
+
+/// Map an XKB layout description to a supported [`LayoutId`].
+///
+/// Sway reports descriptions such as `English (US)` / `Russian`, while
+/// Hyprland usually reports short codes (`us,ru`). Anything else stays
+/// unsupported and disables automatic correction for that group.
+#[must_use]
+pub fn layout_id_from_name(name: &str) -> Option<LayoutId> {
+    let trimmed = name.trim();
+    if let Some(id) = LayoutId::from_code(trimmed) {
+        return Some(id);
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("russian")
+        || lower.contains("(ru")
+        || lower.starts_with("ru ")
+        || lower.starts_with("ru(")
+        || lower.starts_with("ru+")
+    {
+        Some(LayoutId::Ru)
+    } else if lower.contains("english")
+        || lower.contains("(us")
+        || lower.starts_with("us ")
+        || lower.starts_with("us(")
+        || lower.starts_with("us+")
+    {
+        Some(LayoutId::Us)
+    } else {
+        None
+    }
+}
 
 /// One layout entry reported by KDE.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,6 +194,16 @@ impl KdeLayouts {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_compositor_layout_names() {
+        assert_eq!(layout_id_from_name("us"), Some(LayoutId::Us));
+        assert_eq!(layout_id_from_name("RU"), Some(LayoutId::Ru));
+        assert_eq!(layout_id_from_name("English (US)"), Some(LayoutId::Us));
+        assert_eq!(layout_id_from_name("Russian"), Some(LayoutId::Ru));
+        assert_eq!(layout_id_from_name("ru(phonetic)"), Some(LayoutId::Ru));
+        assert_eq!(layout_id_from_name("German"), None);
+    }
 
     #[test]
     #[ignore = "requires a KDE Plasma session with at least two layouts"]

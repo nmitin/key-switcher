@@ -1,0 +1,5 @@
+# LayoutPilot: active-session access to the keyboard and uinput, no root.
+# Install as /etc/udev/rules.d/60-layoutpilot.rules and run:
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+KERNEL=="uinput", SUBSYSTEM=="misc", TAG+="uaccess", OPTIONS+="static_node=uinput"
+SUBSYSTEM=="input", KERNEL=="event*", ENV{ID_INPUT_KEYBOARD}=="1", TAG+="uaccess"

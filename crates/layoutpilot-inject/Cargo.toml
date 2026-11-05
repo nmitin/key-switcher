@@ -1,0 +1,14 @@
+[package]
+name = "layoutpilot-inject"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Wayland-safe uinput injection backend for LayoutPilot"
+
+[dependencies]
+evdev = "0.13"
+layoutpilot-core = { path = "../layoutpilot-core" }
+
+[lints]
+workspace = true

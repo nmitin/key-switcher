@@ -6,6 +6,12 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+/// Name of the virtual keyboard created for injection.
+///
+/// Capture must ignore this device: its events are the daemon's own output and
+/// feeding them back into the engine would create correction loops.
+pub const VIRTUAL_KEYBOARD_NAME: &str = "LayoutPilot Virtual Keyboard";
+
 pub mod buffer;
 pub mod conversion;
 pub mod detector;

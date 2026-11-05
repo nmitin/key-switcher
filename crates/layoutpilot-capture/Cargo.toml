@@ -8,6 +8,7 @@ description = "evdev keyboard capture for LayoutPilot"
 
 [dependencies]
 evdev = "0.13"
+layoutpilot-core = { path = "../layoutpilot-core" }
 
 [lints]
 workspace = true

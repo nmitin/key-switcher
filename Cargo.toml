@@ -9,6 +9,7 @@ members = [
     "crates/layoutpilot-compositor",
     "crates/layoutpilot-config",
     "crates/layoutpilot-capture",
+    "crates/layoutpilot-inject",
 ]
 
 [workspace.package]

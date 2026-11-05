@@ -67,14 +67,25 @@ mode = "auto"
 
 ```toml
 undo_hotkey = "Pause"
-fix_hotkey = "Ctrl+Shift+F"
-pause_hotkey = "Ctrl+Shift+P"
+fix_hotkey = "Ctrl+F8"
+pause_hotkey = "Ctrl+F9"
+double_shift_fix = true
 ```
 
 Формат: `Ctrl`/`Control`, `Alt`, `Shift`, `Super`/`Meta` + клавиша.
 Клавиша — один печатный символ, `Pause`, `Escape`, `Space`, `Tab`, `Enter`,
 `Backspace` или `F1`–`F12`. Пустая строка отключает хоткей. Невалидная строка
 отвергается при загрузке конфига.
+
+`double_shift_fix = true` включает ручной фикс двойным Shift: два нажатия
+Shift без других клавиш между ними исправляют последнее слово. Это работает
+через evdev и не конфликтует с `Ctrl+Shift`. Повторный двойной Shift сразу
+после автокоррекции отменяет её.
+
+Не назначайте хоткеи на сочетания, которыми переключается раскладка. Обычно это
+`Ctrl+Shift` или `Alt+Shift`: демон увидит нажатие, но система одновременно
+сменит раскладку. Поэтому по умолчанию `fix_hotkey = "Ctrl+F8"`, а
+`pause_hotkey = "Ctrl+F9"`.
 
 ## Звук и раскладка
 
@@ -103,19 +114,35 @@ X11-окружениях остаётся XKB group lock.
 ```toml
 [inject]
 request_permission_on_start = true
+delete_mode = "backspace"       # backspace | ctrl-backspace
 layout_settle_ms = 20
+pre_inject_delay_ms = 30
 separator_delay_ms = 20
 ```
 
-`layout_settle_ms` — пауза после смены раскладки перед текстом;
+`delete_mode = "ctrl-backspace"` удаляет слово одним `Ctrl+Backspace` вместо
+подсчёта символов. Это экспериментально: поведение зависит от приложения.
+Помогает, когда хвостовой пробел ещё не дошёл до поля, но в некоторых
+редакторах удаляет лишнее или оставляет двойной пробел.
+
+`layout_settle_ms` — пауза после смены раскладки перед текстом (для uinput
+действует нижняя граница 100 мс); `pre_inject_delay_ms` — пауза перед первым
+Backspace, чтобы композитор успел обработать физическое слово (только uinput);
 `separator_delay_ms` — пауза перед пробелом/Enter. Backspace выполняется до
 переключения раскладки, чтобы не потерять нажатие при перезагрузке keymap. Если Kate/Geany теряют
 последний пробел, увеличьте `separator_delay_ms` до 50–100 мс.
 
-На Wayland KDE первый XTest-ввод может вызвать запрос «Удалённое управление».
-Чтобы он не появлялся в момент набора текста, демон при старте делает один
-безвредный tap Shift. Это не печатает текст и не открывает меню, но является
-настоящим XTest-событием, поэтому KDE показывает запрос один раз — при запуске.
+На X11 используется XTest. На KDE Wayland первый XTest-ввод может вызвать
+запрос «Удалённое управление». Чтобы он не появлялся в момент набора текста,
+демон при старте делает один безвредный tap Shift. Это не печатает текст и не
+открывает меню, но является настоящим XTest-событием, поэтому KDE показывает
+запрос один раз — при запуске.
+
+На Wayland с `inject = "auto"` выбирается uinput, поэтому запрос разрешения не
+нужен: `request_permission_on_start` действует только на XTest. Для uinput
+нужен доступ на запись к `/dev/uinput`; установите
+[`packaging/60-layoutpilot.rules`](../packaging/60-layoutpilot.rules) или
+выдайте ACL пользователю активного сеанса.
 
 Если запрос не нужен, поставьте `false`. В `--dry-run` preflight не выполняется:
 диагностический режим не должен ничего инжектить. Если разрешение не выдано,
@@ -123,13 +150,15 @@ separator_delay_ms = 20
 
 ## Backend'ы
 
-- `capture = "auto"` выбирает `xrecord`, если задан `DISPLAY`, иначе `evdev`.
-- `capture = "evdev"` требует доступ к `/dev/input/event*`; добавьте пользователя
-  в группу `input` или настройте ACL.
-- `inject = "auto"` сейчас означает XTEST на X11. EIS/virtual-keyboard/uinput
-  ещё не реализованы.
-- `layout = "auto"` сейчас означает X11 XKB. Нативные KDE/GNOME/Sway/Hyprland
-  бэкенды ещё не реализованы.
+- `capture = "auto"` выбирает `evdev` на Wayland и `xrecord`, если задан
+  `DISPLAY` на X11.
+- `capture = "evdev"` требует доступ к `/dev/input/event*`; используйте
+  udev-правило `uaccess` (рекомендуется) или группу `input`.
+- `inject = "auto"` означает `uinput` на Wayland и `XTEST` на X11. Явно можно
+  выбрать `uinput` или `xtest`; EIS/virtual-keyboard/clipboard ещё не
+  реализованы.
+- `layout = "auto"` выбирает KDE D-Bus, Sway IPC или Hyprland IPC по сессии;
+  на остальных окружениях — X11 XKB. GNOME-провайдер пока не реализован.
 
 ## Валидация
 

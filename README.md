@@ -2,7 +2,8 @@
 
 Автопереключатель раскладки клавиатуры для Linux. Проект находится на раннем
 этапе: готовы платформенно-независимое ядро, движок, словарный скоринг,
-X11-демон, evdev-capture и конфиг; Wayland-инъекция ещё не реализована.
+X11-демон, evdev-capture, uinput-инъекция и конфиг; провайдеры раскладки есть
+для KDE, Sway и Hyprland.
 
 - ТЗ: [`tz-layout-switcher-v0.2.md`](tz-layout-switcher-v0.2.md)
 - Решения: [`docs/decisions.md`](docs/decisions.md)
@@ -39,20 +40,29 @@ X11-демон, evdev-capture и конфиг; Wayland-инъекция ещё �
 
 `layoutpilot-daemon` — исполняемый вертикальный срез:
 
-- XRecord или evdev → нормализация → `Engine`/`DictionaryDetector` → XTest + XKB;
-- `doctor` для проверки XTEST, XKB, RECORD/evdev, фокуса и словарей;
+- XRecord/evdev → нормализация → `Engine`/`DictionaryDetector` → XTest/uinput
+  + переключение раскладки;
+- `doctor` для проверки выбранных capture/inject/layout-бэкендов, фокуса и словарей;
 - `run --dry-run` для просмотра планов без инъекции;
 - конфиг `~/.config/layoutpilot/config.toml` или `--config PATH`;
 - порядок XKB-групп задаётся в `[layout] order`;
-- подавление собственных XTest-событий по журналу инъектора;
+- подавление собственных событий XTest и uinput;
 - профили по `WM_CLASS` (терминалы — `manual`, KeePass — `off`);
 - глобальные хоткеи undo/fix/pause из конфига; на X11 — с `XGrabKey`;
-- на Wayland — startup-запрос XTest-разрешения одним Shift-tap;
+- на X11 — startup-запрос XTest-разрешения одним Shift-tap;
 - KDE: переключение раскладки через D-Bus + XKB-синхронизация;
+- Sway/Hyprland: переключение раскладки через IPC композитора;
 - звуковой индикатор смены раскладки (`sound_on_layout_change`, по умолчанию
   системный звук затвора);
 - разделитель удаляется вместе со словом и вставляется отдельным шагом:
   первая буква не остаётся, последний пробел не пропадает.
+
+`layoutpilot-inject` — Wayland-инъекция:
+
+- uinput-клавиатура `LayoutPilot Virtual Keyboard`;
+- перевод текста в физические keycode+Shift по таблице раскладки;
+- Backspace, Enter и Tab;
+- отпускание всех клавиш при ошибке и на `Drop`.
 
 `layoutpilot-config` — TOML-конфиг:
 
@@ -65,6 +75,7 @@ X11-демон, evdev-capture и конфиг; Wayland-инъекция ещё �
 `layoutpilot-capture` — evdev:
 
 - перечисление `/dev/input/event*` и фильтр клавиатур по letter-keys;
+- пропуск собственной uinput-клавиатуры по имени;
 - неблокирующее чтение в отдельном потоке на устройство;
 - evdev keycode → XKB keycode (`+8`);
 - hotplug пока не поддерживается.
@@ -72,6 +83,9 @@ X11-демон, evdev-capture и конфиг; Wayland-инъекция ещё �
 `layoutpilot-compositor` — раскладка на уровне композитора:
 
 - KDE Plasma D-Bus `org.kde.keyboard` / `org.kde.KeyboardLayouts`;
+- Sway IPC: `GET_INPUTS`, `xkb_switch_layout`, свой XKB-индекс;
+- Hyprland IPC: `j/devices`, `j/getoption input:kb_layout`,
+  `switchxkblayout all N`;
 - список раскладок и `setLayout` по коду `us`/`ru`;
 - синхронизация XKB-группы для XWayland-инъекции.
 
@@ -131,6 +145,16 @@ cargo run -p layoutpilot-daemon -- run --dry-run
 
 Требуется Rust 1.85+ и системные XKB-данные только для перегенерации таблиц.
 
+Для Wayland-сессии нужен доступ к `/dev/input/event*` и `/dev/uinput`:
+
+```sh
+sudo install -m 644 packaging/60-layoutpilot.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+После этого `layoutpilot doctor` должен показать `uinput: ok` и
+`capture: ok (evdev)`. На X11 достаточно `DISPLAY` и XTest.
+
 ## Структура
 
 ```
@@ -139,10 +163,13 @@ crates/
   layoutpilot-core/      конвертация, сегментация, буфер, движок
   layoutpilot-dict/      FST-словари, биграммы, DictionaryDetector
   layoutpilot-x11/       XTest, XRecord, XKB state, фокус
-  layoutpilot-compositor/KDE D-Bus раскладки
+  layoutpilot-inject/    uinput-инъекция для Wayland
+  layoutpilot-compositor/KDE D-Bus, Sway и Hyprland IPC
   layoutpilot-config/    TOML, валидация, профили, порядок раскладок
   layoutpilot-capture/   evdev-захват клавиатур
   layoutpilot-daemon/    бинарник layoutpilot: capture → engine → inject
+packaging/
+  60-layoutpilot.rules   udev uaccess для /dev/input и /dev/uinput
 config.example.toml      пример конфигурации
 data/
   xkb/                   сгенерированные таблицы и их происхождение
@@ -170,17 +197,24 @@ cargo test --workspace
   считаются неизвестными.
 - Нет word-bigram контекста и layout prior; калибровка температуры и
   `known_bias` предварительная (этап 3).
-- Есть X11-демон и evdev-capture, но нет Wayland-инъекции (EIS/virtual-keyboard).
-  evdev на чистом Wayland без XWayland пока не даёт переключать раскладку.
-- XRecord видит только X11/XWayland-приложения. Проверено: XWayland-Kate
-  (`QT_QPA_PLATFORM=xcb kate`) корректируется, нативные Kate и Geany — нет.
-  Layout state пока опрашивается по требованию, без `XkbStateNotify`.
+- Есть Wayland-инъекция через uinput и провайдеры KDE/Sway/Hyprland, но нет
+  EIS и `virtual-keyboard-v1`. uinput создаёт отдельную клавиатуру: в играх и
+  per-device композиторах это надо учитывать.
+- GNOME-провайдер раскладки не реализован; на GNOME `layout = "auto"` уходит
+  в X11/XWayland.
+- KDE: вариант раскладки (`ru+phonetic`) и сигнал `layoutChanged` пока не
+  читаются; layout state опрашивается на каждое нажатие.
+- Sway/Hyprland-провайдеры покрыты тестами с fake IPC, но живьём ещё не
+  проверялись; в per-device композиторах у uinput-устройства может быть своя
+  группа раскладки.
+- XRecord видит только X11/XWayland-приложения. На Wayland `capture = "auto"`
+  теперь выбирает evdev, поэтому нативные окна тоже видны.
 - evdev перечисляет устройства один раз при старте: hotplug не реализован.
 - Порядок XKB-групп задаётся в конфиге, но автоопределение групп ещё не сделано.
 - При конфликте `XGrabKey` хоткей остаётся пассивным: приложение тоже получает
   нажатие.
-- Startup-запрос разрешения на Wayland рассчитан на KDE-поведение XWayland;
-  на других композиторах он может быть не нужен или не сработать.
+- Startup-запрос разрешения рассчитан на XTest/KDE XWayland; для uinput он не
+  нужен.
 - Нет hot reload конфига и per-window раскладки.
 - Обучение и LLM-поля конфига читаются, но пока не влияют на поведение.
 

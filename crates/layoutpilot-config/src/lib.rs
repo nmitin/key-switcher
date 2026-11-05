@@ -94,6 +94,21 @@ pub enum InjectBackend {
     Clipboard,
 }
 
+/// How the injector removes the mistyped word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DeleteMode {
+    /// Send one Backspace per character, including the separator.
+    #[default]
+    Backspace,
+    /// Send a single Ctrl+Backspace and let the application delete the word.
+    ///
+    /// This is experimental: behavior depends on the toolkit. It helps when
+    /// the trailing separator has not reached the application yet, because the
+    /// word boundary is resolved by the application itself.
+    CtrlBackspace,
+}
+
 /// Layout backend choice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -212,6 +227,8 @@ pub struct GeneralConfig {
     pub sound_file: String,
     /// Treat Backspace after a correction as undo.
     pub backspace_undo: bool,
+    /// Double Shift fixes the last word (triple Shift is reserved for phrases).
+    pub double_shift_fix: bool,
 }
 
 impl Default for GeneralConfig {
@@ -223,11 +240,12 @@ impl Default for GeneralConfig {
             min_word_len: 3,
             confidence_threshold: 0.97,
             undo_hotkey: "Pause".to_owned(),
-            fix_hotkey: "Ctrl+Shift+F".to_owned(),
-            pause_hotkey: "Ctrl+Shift+P".to_owned(),
+            fix_hotkey: "Ctrl+F8".to_owned(),
+            pause_hotkey: "Ctrl+F9".to_owned(),
             sound_on_layout_change: true,
             sound_file: "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga".to_owned(),
             backspace_undo: true,
+            double_shift_fix: true,
         }
     }
 }
@@ -295,6 +313,16 @@ pub struct InjectConfig {
     pub request_permission_on_start: bool,
     /// Pause after switching layout before editing text, in milliseconds.
     pub layout_settle_ms: u64,
+    /// How to delete the mistyped word before typing the replacement.
+    pub delete_mode: DeleteMode,
+    /// Pause before the first Backspace, in milliseconds.
+    ///
+    /// On Wayland the daemon reads evdev directly and can overtake the
+    /// compositor: the physical word may not have reached the focused
+    /// application yet when injection starts. The pause lets the compositor
+    /// process the trigger and the word before correction. Only used with
+    /// uinput.
+    pub pre_inject_delay_ms: u64,
     /// Pause before typing the separator, in milliseconds.
     pub separator_delay_ms: u64,
 }
@@ -306,7 +334,9 @@ impl Default for InjectConfig {
             allow_uinput_in_games: false,
             restore_clipboard: true,
             request_permission_on_start: true,
+            delete_mode: DeleteMode::Backspace,
             layout_settle_ms: 20,
+            pre_inject_delay_ms: 30,
             separator_delay_ms: 20,
         }
     }
@@ -591,6 +621,7 @@ mod tests {
         assert!((config.general.confidence_threshold - 0.97).abs() < f32::EPSILON);
         assert_eq!(config.capture.backend, CaptureBackend::Auto);
         assert_eq!(config.inject.backend, InjectBackend::Auto);
+        assert_eq!(config.inject.delete_mode, DeleteMode::Backspace);
         assert!(config.inject.request_permission_on_start);
         assert!(config.general.sound_on_layout_change);
         assert!(config.general.sound_file.contains("camera-shutter"));
@@ -648,6 +679,12 @@ mode = "auto"
         );
         assert_eq!(resolver.resolve("org.gnome.Terminal"), Profile::Manual);
         assert_eq!(resolver.resolve("firefox"), Profile::Auto);
+    }
+
+    #[test]
+    fn parses_delete_mode() {
+        let config = Config::from_toml_str("[inject]\ndelete_mode = \"ctrl-backspace\"\n").unwrap();
+        assert_eq!(config.inject.delete_mode, DeleteMode::CtrlBackspace);
     }
 
     #[test]

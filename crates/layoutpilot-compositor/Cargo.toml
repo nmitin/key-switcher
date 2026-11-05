@@ -4,10 +4,11 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Compositor-specific layout backends for LayoutPilot"
+description = "KDE, Sway and Hyprland layout backends for LayoutPilot"
 
 [dependencies]
 layoutpilot-core = { path = "../layoutpilot-core" }
+serde_json = "1"
 zbus = "4"
 
 [lints]

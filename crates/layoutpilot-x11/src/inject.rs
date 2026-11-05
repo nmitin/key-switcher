@@ -16,6 +16,8 @@ pub const RETURN_KEYCODE: u8 = 36;
 pub const TAB_KEYCODE: u8 = 23;
 /// Standard evdev keycode for Shift.
 pub const SHIFT_KEYCODE: u8 = 50;
+/// Standard evdev keycode for left Control.
+pub const CTRL_KEYCODE: u8 = 37;
 
 /// Injects key events through the XTEST extension.
 #[derive(Debug)]
@@ -110,6 +112,14 @@ impl X11Injector {
             self.queue_keycode(BACKSPACE_KEYCODE, false)?;
         }
         self.connection.flush()?;
+        Ok(())
+    }
+
+    /// Delete the previous word with one Ctrl+Backspace.
+    pub fn tap_ctrl_backspace(&mut self) -> Result<(), X11Error> {
+        self.press_keycode(CTRL_KEYCODE)?;
+        self.tap_keycode(BACKSPACE_KEYCODE, false)?;
+        self.release_keycode(CTRL_KEYCODE)?;
         Ok(())
     }
 

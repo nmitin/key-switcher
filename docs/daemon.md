@@ -1,16 +1,15 @@
 # Демон
 
-`layoutpilot` — первый работающий вертикальный срез. Он связывает уже готовые
-части:
+`layoutpilot` — вертикальный срез. Он связывает уже готовые части:
 
 ```
-XRecord/evdev ──▶ XKB layout ──▶ char_for ──▶ CorrectionManager
-                                              │
-                                              ▼
-                                  CorrectionPlan (layout, Backspace, text)
-                                              │
-                                              ▼
-                              XKB switch_to + XTest backspace/text
+XRecord/evdev ──▶ layout provider ──▶ char_for ──▶ CorrectionManager
+                                                   │
+                                                   ▼
+                                       CorrectionPlan (layout, Backspace, text)
+                                                   │
+                                                   ▼
+                              switch_to + XTest/uinput backspace/text
 ```
 
 ## Команды
@@ -21,37 +20,39 @@ cargo run -p layoutpilot-daemon -- run --dry-run
 cargo run -p layoutpilot-daemon -- run
 ```
 
-- `doctor` проверяет XTEST, XKB, RECORD/evdev, фокус и словари.
+- `doctor` проверяет выбранные capture/inject/layout-бэкенды, фокус и словари.
 - `--config PATH` задаёт файл конфигурации; по умолчанию
   `$XDG_CONFIG_HOME/layoutpilot/config.toml` или `~/.config/layoutpilot/config.toml`.
 - `run --dry-run` печатает планы, ничего не вводя.
-- `run` выполняет коррекции в активном X11-окне.
+- `run` выполняет коррекции в активном окне.
 
-Для X11-инъекции нужен `DISPLAY`. Бинарник называется `layoutpilot`.
-evdev-capture можно включить через `[capture] backend = "evdev"`; для этого
-нужен доступ к `/dev/input/event*`.
+На X11 нужен `DISPLAY` и XTest. На Wayland нужен доступ к `/dev/input/event*`
+и `/dev/uinput`: демон читает evdev и печатает через uinput. Установите
+[`packaging/60-layoutpilot.rules`](../packaging/60-layoutpilot.rules) или
+настройте ACL. Бинарник называется `layoutpilot`.
 
-На Wayland при `inject.request_permission_on_start = true` демон при старте
-делает один Shift-tap, чтобы KDE показал запрос на управление вводом сразу,
-а не в момент первой коррекции. Это не текст и не меню; если запрос не нужен,
-поставьте `false`. В `--dry-run` preflight не выполняется. Если в разрешении
-отказано, инъекция не сработает.
+На X11/KDE XWayland при `inject.request_permission_on_start = true` демон при
+старте делает один Shift-tap, чтобы KDE показал запрос на управление вводом
+сразу, а не в момент первой коррекции. Для uinput этот запрос не нужен.
+В `--dry-run` preflight не выполняется.
 
 ## Что делает демон
 
 1. Выбранный capture-backend (`xrecord` или `evdev`) приносит key-события.
-2. На каждый `KeyPress` демон обновляет XKB-группу и фокус. Для evdev
+2. На каждый `KeyPress` демон обновляет активную раскладку и фокус. Для evdev
    модификаторы (Shift/Ctrl/Alt/Super/CapsLock) отслеживаются вручную.
 3. `char_for` превращает keycode в символ с учётом Shift и Caps Lock.
 4. `CorrectionManager` отдаёт план: `layout`, число Backspace, текст.
-5. Демон делает Backspace, переключает раскладку и печатает текст через XTest.
-   На KDE это D-Bus `org.kde.keyboard` + синхронизация XKB-группы; на остальных
-   X11-окружениях — XKB group lock. Разделитель удаляется вместе со словом и
-   печатается обратно отдельным шагом после `separator_delay_ms` (по умолчанию
-   20 мс); перед редактированием выдерживается `layout_settle_ms` (ADR-018).
-6. События собственной инъекции записываются в очередь подавления (FR-09):
-   `X11Injector` ведёт журнал отправленных `(keycode, press/release)`, а демон
-   выкидывает совпадающие записи из capture-потока.
+5. Демон выдерживает `pre_inject_delay_ms` (uinput), делает Backspace,
+   переключает раскладку и печатает текст.
+   - X11: XTest; на KDE — D-Bus `org.kde.keyboard` + синхронизация XKB-группы.
+   - Wayland: uinput; на KDE — D-Bus, на Sway/Hyprland — IPC композитора.
+   Разделитель удаляется вместе со словом и печатается обратно отдельным шагом
+   после `separator_delay_ms` (по умолчанию 20 мс); перед редактированием
+   выдерживается `layout_settle_ms` (для uinput — не меньше 100 мс, ADR-018).
+6. События собственной инъекции подавляются (FR-09): XTest ведёт журнал
+   отправленных `(keycode, press/release)`, а evdev-путь игнорирует устройство
+   `LayoutPilot Virtual Keyboard` и дополнительно проверяет имя устройства.
 
 Особые клавиши:
 
@@ -69,8 +70,8 @@ evdev-capture можно включить через `[capture] backend = "evdev
 
 ```toml
 undo_hotkey = "Pause"
-fix_hotkey = "Ctrl+Shift+F"
-pause_hotkey = "Ctrl+Shift+P"
+fix_hotkey = "Ctrl+F8"
+pause_hotkey = "Ctrl+F9"
 ```
 
 - undo — отменяет последнюю коррекцию; повторное нажатие возвращает её
@@ -86,8 +87,13 @@ Caps Lock и Num Lock игнорируются. Поддерживаются о�
 Caps Lock/Num Lock. Если захват удался, активное приложение нажатие не получает.
 Если комбинация уже занята другим клиентом (`BadAccess`), демон пишет
 предупреждение и оставляет этот хоткей пассивным: он сработает, но приложение
-его тоже увидит. Без `DISPLAY` (evdev на Wayland) остаётся только пассивный
-режим.
+его тоже увидит.
+
+На Wayland `XGrabKey` не используется: он работает только с XWayland и может
+«успешно» захватить клавишу, которую нативное окно всё равно не отдаст. Хоткеи
+сопоставляются в evdev-потоке; приложение тоже может их увидеть. Основной
+ручной жест — двойной Shift (последнее слово) и повторный двойной Shift после
+коррекции для отмены.
 
 ## KDE: раскладка на окно
 
@@ -124,20 +130,37 @@ Caps Lock/Num Lock. Если захват удался, активное при�
 В KDE Wayland:
 
 - `QT_QPA_PLATFORM=xcb kate` — Kate становится XWayland-клиентом. Демон видит
-  фокус и нажатия, коррекция `ghbdtn ` → `привет ` работает.
+  фокус и нажатия, коррекция `ghbdtn ` → `привет ` работает через XTest.
 - `kate` без переменной и `geany` — нативные Wayland-клиенты. XRecord их не
-  видит: в логе фокус остаётся на служебном X11-окне, нажатия не приходят.
+  видит; для них нужен путь evdev-capture + uinput-инъекция. Код этого пути
+  добавлен, но в среде разработки `/dev/uinput` недоступен, поэтому живой
+  прогон на нативном окне ещё нужен.
 
-Это не ошибка движка, а граница текущего capture-бэкенда. Для нативных
-Wayland-окон нужен отдельный Wayland-путь: evdev-capture + EIS/virtual-keyboard
-инъекция и layout state через KDE D-Bus/GNOME gsettings.
+На X11 поведение не изменилось: XRecord + XTest + XKB.
+
+`doctor` в KDE Wayland без uinput показывает:
+
+```text
+session: wayland
+uinput: FAIL (uinput I/O error: No such file or directory)
+KDE layouts: ok (current=Some(Ru), list=[("us", Some(Us)), ("ru", Some(Ru))])
+capture: FAIL (/dev/input does not exist)
+```
+
+После установки udev-правила и появления доступа к `/dev/input` и `/dev/uinput`
+обе строки должны стать `ok`.
 
 ## Ограничения
 
-- Layout state опрашивается на каждое нажатие, а не через `XkbStateNotify`.
+- Layout state опрашивается на каждое нажатие, а не через события
+  `XkbStateNotify`/`layoutChanged`; Sway/Hyprland дёргают IPC на каждое событие.
 - evdev-устройства перечисляются один раз при старте: hotplug не реализован.
-- evdev не даёт состояние раскладки; группа берётся из XKB (X11). На чистом
-  Wayland без XWayland этого пути пока нет.
+- GNOME-провайдер раскладки не реализован; на GNOME `layout = "auto"` уходит
+  в X11/XWayland.
+- KDE: вариант раскладки (`ru+phonetic`) и `layoutChanged` пока не читаются.
+- uinput создаёт новое устройство: в per-device композиторах у него может быть
+  своя группа, а античиты/игры видят его как клавиатуру. `allow_uinput_in_games`
+  читается, но детекта игр ещё нет.
 - Порядок групп задаётся в `[layout] order`, но автоопределение групп ещё
   не сделано.
 - При неудачном `XGrabKey` (конфликт с другим клиентом) хоткей остаётся
@@ -147,8 +170,6 @@ Wayland-окон нужен отдельный Wayland-путь: evdev-capture +
 - Предполагается, что разделитель уже дошёл до приложения к моменту
   инъекции; на практике XTest-очередь идёт после исходного события.
 - Нет hot reload конфига, трея и systemd-юнита; конфиг читается при старте.
-- KDE layout state читается через D-Bus на каждое нажатие; сигнал
-  `layoutChanged` ещё не подписан.
 - Звук проверен по коду и доступности плееров, но не прослушан в этой сессии.
 - `--dry-run` обновляет состояние менеджера, но не переключает раскладку:
   это диагностический режим, а не полноценная сессия.
@@ -156,17 +177,9 @@ Wayland-окон нужен отдельный Wayland-путь: evdev-capture +
 ## Проверка
 
 ```sh
-cargo test -p layoutpilot-daemon
-DISPLAY=:1 cargo run -p layoutpilot-daemon -- doctor
+cargo test --workspace
+cargo run -p layoutpilot-daemon -- doctor
 ```
 
-`doctor` на XWayland в этом окружении:
-
-```text
-XTEST: ok
-XKB: ok (group 0, active Some(Us))
-focus: window=0x200000, app=None
-capture: ok (xrecord)
-dictionary: ru(привет)=177992, en(hello)=405534
-result: ok
-```
+Для Wayland-сессии `doctor` проверяет uinput, KDE/Sway/Hyprland IPC и evdev;
+для X11 — XTEST, XKB и XRecord.

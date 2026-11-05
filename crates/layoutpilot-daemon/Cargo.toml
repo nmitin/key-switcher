@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "X11 daemon that connects capture, correction engine and injection"
+description = "Capture, correction engine and injection daemon for LayoutPilot"
 
 [dependencies]
 layoutpilot-core = { path = "../layoutpilot-core" }
@@ -12,6 +12,7 @@ layoutpilot-compositor = { path = "../layoutpilot-compositor" }
 layoutpilot-config = { path = "../layoutpilot-config" }
 layoutpilot-capture = { path = "../layoutpilot-capture" }
 layoutpilot-dict = { path = "../layoutpilot-dict" }
+layoutpilot-inject = { path = "../layoutpilot-inject" }
 layoutpilot-x11 = { path = "../layoutpilot-x11" }
 
 [[bin]]

@@ -8,11 +8,12 @@ triggers = ["space", "enter"]      # space | punct | tab | enter
 min_word_len = 3
 confidence_threshold = 0.97
 undo_hotkey = "Pause"
-fix_hotkey = "Ctrl+Shift+F"
-pause_hotkey = "Ctrl+Shift+P"
+fix_hotkey = "Ctrl+F8"
+pause_hotkey = "Ctrl+F9"
 sound_on_layout_change = true       # звук при смене раскладки
 sound_file = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
 backspace_undo = true
+double_shift_fix = true             # двойной Shift — исправить последнее слово
 
 [capture]
 backend = "auto"                   # auto | evdev | xrecord | portal | ime
@@ -32,8 +33,10 @@ llm_suggest = true
 backend = "auto"                   # auto | xtest | eis | virtual-keyboard | uinput | clipboard
 allow_uinput_in_games = false
 restore_clipboard = true
-request_permission_on_start = true   # Wayland: one Shift tap triggers the XTest permission prompt
+request_permission_on_start = true   # X11/KDE XWayland only; uinput does not need it
+delete_mode = "backspace"          # backspace | ctrl-backspace (экспериментально)
 layout_settle_ms = 20               # пауза после смены раскладки
+pre_inject_delay_ms = 30           # uinput: дать композитору обработать ввод
 separator_delay_ms = 20            # пауза перед пробелом/Enter
 
 [layout]

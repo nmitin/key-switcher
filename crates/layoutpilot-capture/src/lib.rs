@@ -182,6 +182,11 @@ pub fn probe_keyboards() -> Result<Vec<KeyboardInfo>, EvdevError> {
 
         match Device::open(&path) {
             Ok(device) => {
+                if device.name() == Some(layoutpilot_core::VIRTUAL_KEYBOARD_NAME) {
+                    // Own injection device: feeding its events back would create
+                    // a correction loop.
+                    continue;
+                }
                 if is_keyboard(&device) {
                     keyboards.push(KeyboardInfo {
                         path: path.clone(),
