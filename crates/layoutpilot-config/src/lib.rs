@@ -238,7 +238,7 @@ impl Default for GeneralConfig {
         Self {
             enabled: true,
             languages: vec!["ru".to_owned(), "en".to_owned()],
-            triggers: vec![Trigger::Space, Trigger::Enter],
+            triggers: vec![Trigger::Space],
             min_word_len: 3,
             confidence_threshold: 0.97,
             undo_hotkey: "Pause".to_owned(),
@@ -625,10 +625,7 @@ mod tests {
         let config = Config::default();
         assert!(config.general.enabled);
         assert_eq!(config.general.languages, vec!["ru", "en"]);
-        assert_eq!(
-            config.general.triggers,
-            vec![Trigger::Space, Trigger::Enter]
-        );
+        assert_eq!(config.general.triggers, vec![Trigger::Space]);
         assert_eq!(config.general.min_word_len, 3);
         assert!((config.general.confidence_threshold - 0.97).abs() < f32::EPSILON);
         assert_eq!(config.capture.backend, CaptureBackend::Auto);

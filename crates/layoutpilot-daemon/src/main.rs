@@ -8,6 +8,7 @@
 //! and falls back to built-in defaults.
 
 mod kde_focus;
+mod tail;
 
 use std::collections::{HashSet, VecDeque};
 use std::env;
@@ -32,6 +33,7 @@ use layoutpilot_x11::{
     char_for, modifiers, KeyEvent, X11Focus, X11HotkeyGrabber, X11Injector, X11LayoutState,
     XRecordCapture,
 };
+use tail::{tail_text, Blocked, PendingKey};
 
 const BACKSPACE_KEYCODE: u8 = 22;
 const RETURN_KEYCODE: u8 = 36;
@@ -39,6 +41,15 @@ const TAB_KEYCODE: u8 = 23;
 const SPACE_KEYCODE: u8 = 65;
 const ESCAPE_KEYCODE: u8 = 9;
 const IGNORE_WINDOW: Duration = Duration::from_millis(750);
+/// How long a correction waits for a physical modifier to be released.
+/// Modifiers are seat-wide on Wayland: a held Shift or Ctrl would combine with
+/// the synthetic Backspace/letters.
+const MODIFIER_RELEASE_WAIT: Duration = Duration::from_millis(300);
+/// Capture threads poll devices every few ms; give them time to deliver keys
+/// pressed during injection before checking for them.
+const CAPTURE_LAG: Duration = Duration::from_millis(10);
+/// Repair passes for keys typed during injection before giving up.
+const MAX_REPAIRS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HotkeyAction {
@@ -395,6 +406,10 @@ impl EvdevModifiers {
         false
     }
 
+    fn any_held(&self) -> bool {
+        !self.pressed.is_empty()
+    }
+
     fn state(&self) -> u16 {
         let mut state = 0;
         if self.pressed.contains(&EVDEV_LEFTSHIFT) || self.pressed.contains(&EVDEV_RIGHTSHIFT) {
@@ -455,6 +470,10 @@ impl Capture {
         }
     }
 
+    fn try_recv(&mut self) -> Result<Option<CapturedEvent>, Box<dyn Error>> {
+        self.recv_timeout(Duration::ZERO)
+    }
+
     fn stop(&mut self) {
         match self {
             Self::X11(capture) => {
@@ -490,6 +509,9 @@ struct Daemon {
     clear_on_focus_change: bool,
     ignore: VecDeque<(u8, bool)>,
     ignore_until: Instant,
+    /// Physical keys taken out of capture by a correction (its tail) and not
+    /// yet fed to the engine. Always processed before new capture events.
+    backlog: VecDeque<PendingKey>,
     pending_enter: bool,
     pending_space: bool,
     enter_ignore_until: Instant,
@@ -562,6 +584,7 @@ impl Daemon {
             clear_on_focus_change,
             ignore: VecDeque::new(),
             ignore_until: Instant::now(),
+            backlog: VecDeque::new(),
             pending_enter: false,
             pending_space: false,
             enter_ignore_until: Instant::now(),
@@ -589,6 +612,11 @@ impl Daemon {
             self.poll_hotkeys()?;
             if Instant::now() >= self.ignore_until && !self.ignore.is_empty() {
                 self.ignore.clear();
+            }
+
+            if let Some(key) = self.backlog.pop_front() {
+                self.dispatch(key)?;
+                continue;
             }
 
             match self.capture.recv_timeout(Duration::from_millis(50)) {
@@ -619,52 +647,73 @@ impl Daemon {
     }
 
     fn handle_captured(&mut self, event: CapturedEvent) -> Result<(), Box<dyn Error>> {
-        match event {
-            CapturedEvent::X11(event) => self.handle_key(event),
-            CapturedEvent::Evdev(event) => self.handle_evdev(event),
+        match self.normalize(event) {
+            Some(key) => self.dispatch(key),
+            None => Ok(()),
         }
     }
 
-    fn handle_evdev(&mut self, event: EvdevKeyEvent) -> Result<(), Box<dyn Error>> {
-        if event.device == layoutpilot_core::VIRTUAL_KEYBOARD_NAME {
-            // Own uinput output. Capture normally filters the device out, but
-            // this also protects against a device opened before injection.
-            return Ok(());
-        }
-        let Some(evdev_keycode) = event.keycode.checked_sub(8) else {
-            return Ok(());
-        };
-        let modifier = self.evdev_modifiers.update(evdev_keycode, event.value);
-        let Ok(keycode) = u8::try_from(event.keycode) else {
-            return Ok(());
-        };
-        let x11_event = KeyEvent {
-            keycode,
-            state: self.evdev_modifiers.state(),
-            time: 0,
-            pressed: event.pressed(),
-        };
-        if modifier {
-            // Modifiers never reach handle_key, so feed the Shift gesture here.
-            if self.paused {
-                self.shift_gesture.reset();
-            } else if self.config.general.double_shift_fix {
-                if let Some(action) =
-                    self.shift_gesture
-                        .on_key(keycode, event.pressed(), Instant::now())
-                {
-                    self.handle_shift_gesture(action, &x11_event)?;
+    /// Filter own events and resolve modifier state. Must be called exactly
+    /// once per captured event, in capture order.
+    fn normalize(&mut self, event: CapturedEvent) -> Option<PendingKey> {
+        match event {
+            CapturedEvent::X11(event) => {
+                if self.consume_own(&event) {
+                    return None;
                 }
+                // X11 events carry their own state; track held modifiers
+                // only so that injection can wait for their release.
+                if let Some(evdev_keycode) = u16::from(event.keycode).checked_sub(8) {
+                    self.evdev_modifiers
+                        .update(evdev_keycode, i32::from(event.pressed));
+                }
+                Some(PendingKey {
+                    event,
+                    evdev_modifier: false,
+                })
             }
-            return Ok(());
+            CapturedEvent::Evdev(event) => {
+                if event.device == layoutpilot_core::VIRTUAL_KEYBOARD_NAME {
+                    // Own uinput output. Capture normally filters the device
+                    // out, but this also protects against a device opened
+                    // before injection.
+                    return None;
+                }
+                let evdev_keycode = event.keycode.checked_sub(8)?;
+                let modifier = self.evdev_modifiers.update(evdev_keycode, event.value);
+                let keycode = u8::try_from(event.keycode).ok()?;
+                Some(PendingKey {
+                    event: KeyEvent {
+                        keycode,
+                        state: self.evdev_modifiers.state(),
+                        time: 0,
+                        pressed: event.pressed(),
+                    },
+                    evdev_modifier: modifier,
+                })
+            }
         }
-        self.handle_key(x11_event)
+    }
+
+    fn dispatch(&mut self, key: PendingKey) -> Result<(), Box<dyn Error>> {
+        if !key.evdev_modifier {
+            return self.handle_key(key.event);
+        }
+        // Modifiers never reach handle_key, so feed the Shift gesture here.
+        if self.paused {
+            self.shift_gesture.reset();
+        } else if self.config.general.double_shift_fix {
+            if let Some(action) =
+                self.shift_gesture
+                    .on_key(key.event.keycode, key.event.pressed, Instant::now())
+            {
+                self.handle_shift_gesture(action, &key.event)?;
+            }
+        }
+        Ok(())
     }
 
     fn handle_key(&mut self, event: KeyEvent) -> Result<(), Box<dyn Error>> {
-        if self.consume_own(&event) {
-            return Ok(());
-        }
         if event.keycode == RETURN_KEYCODE
             && event.pressed
             && Instant::now() < self.enter_ignore_until
@@ -706,16 +755,22 @@ impl Daemon {
             return Ok(());
         }
 
+        if self.pending_space && event.keycode != SPACE_KEYCODE {
+            // A key arrived before the space release. It has already reached
+            // the application after the space, so it becomes the first key of
+            // the correction's tail and is processed afterwards.
+            self.pending_space = false;
+            self.backlog.push_front(PendingKey {
+                event,
+                evdev_modifier: false,
+            });
+            return self.handle_char(' ', &event);
+        }
+
         if self.config.general.double_shift_fix {
             let _ = self
                 .shift_gesture
                 .on_key(event.keycode, true, Instant::now());
-        }
-
-        if self.pending_space && event.keycode != SPACE_KEYCODE {
-            // A key arrived before the space release: preserve input order.
-            self.pending_space = false;
-            self.handle_char(' ', &event)?;
         }
         if event.keycode == SPACE_KEYCODE && self.config.general.triggers.contains(&Trigger::Space)
         {
@@ -981,24 +1036,48 @@ impl Daemon {
             return Ok(());
         }
 
-        let previous_layout = self.active_layout;
         if let Some(delay) = self.pre_inject_delay() {
             std::thread::sleep(delay);
         }
+        // Keys typed after the trigger have already reached the application.
+        let mut keys = Vec::new();
+        self.collect_pending(&mut keys)?;
+        let tail = match tail_text(&keys, plan.layout.table()) {
+            Ok(_) if self.evdev_modifiers.any_held() => Err("modifier held"),
+            Ok(tail) => Ok(tail),
+            Err(Blocked::Shortcut) => Err("shortcut typed"),
+            Err(Blocked::NonText(_)) => Err("editing key typed"),
+        };
+        let tail = match tail {
+            Ok(tail) => tail,
+            Err(reason) => {
+                self.skip_plan(reason, keys);
+                return Ok(());
+            }
+        };
+        let tail_len = tail.chars().count();
+
+        let previous_layout = self.active_layout;
         // Delete first, while the old layout is still active: switching the
         // layout reloads the XWayland keymap and can swallow one Backspace.
         match self.config.inject.delete_mode {
-            DeleteMode::Backspace => self.injector.tap_backspace(plan.backspaces)?,
-            DeleteMode::CtrlBackspace if plan.backspaces > 0 => {
-                self.injector.tap_ctrl_backspace()?;
+            DeleteMode::CtrlBackspace if tail_len == 0 => {
+                if plan.backspaces > 0 {
+                    self.injector.tap_ctrl_backspace()?;
+                }
             }
-            DeleteMode::CtrlBackspace => {}
+            // Ctrl+Backspace cannot delete "word + tail" reliably.
+            DeleteMode::CtrlBackspace | DeleteMode::Backspace => {
+                self.injector.tap_backspace(plan.backspaces + tail_len)?;
+            }
         }
         self.layouts.switch_to(plan.layout)?;
         if previous_layout != Some(plan.layout) || self.layouts.always_switch() {
             std::thread::sleep(self.layout_settle_delay());
         }
         self.injector.tap_text(&plan.text, plan.layout.table())?;
+        // Everything typed after the deletion point; used by repairs.
+        let mut typed = plan.text.clone();
         if let Some(separator) = plan.separator {
             // Send the separator as a separate, delayed key event. Some
             // XWayland clients (Kate/Geany) drop it when it follows a layout
@@ -1006,24 +1085,102 @@ impl Daemon {
             std::thread::sleep(Duration::from_millis(self.config.inject.separator_delay_ms));
             self.injector
                 .tap_text(&separator.to_string(), plan.layout.table())?;
+            typed.push(separator);
+        }
+        if !tail.is_empty() {
+            self.injector.tap_text(&tail, plan.layout.table())?;
+            typed.push_str(&tail);
         }
         self.active_layout = Some(plan.layout);
         if previous_layout != Some(plan.layout) {
             self.sound.play();
         }
-
-        self.ignore.extend(self.injector.take_sent_events());
-        self.ignore_until = Instant::now() + IGNORE_WINDOW;
+        self.remember_own_events();
         if plan.separator == Some('\n') {
             // Synthetic Return can be captured again and start a second
             // correction. Ignore Return presses for a short window.
             self.enter_ignore_until = Instant::now() + Duration::from_millis(300);
         }
         println!(
-            "layoutpilot: {:?} → layout {}, {} backspaces, {:?}",
-            plan.kind, plan.layout, plan.backspaces, plan.text
+            "layoutpilot: {:?} → layout {}, {} backspaces, {} chars, tail {}",
+            plan.kind,
+            plan.layout,
+            plan.backspaces,
+            plan.text.chars().count(),
+            tail_len
         );
+
+        self.repair_interleaved(&plan, &mut typed, &mut keys)?;
+        // Feed the tail to the engine; it is now text in the target layout.
+        self.backlog.extend(keys);
         Ok(())
+    }
+
+    /// Keys pressed while the replacement was being typed landed somewhere
+    /// inside it. Each produced exactly one character after the deletion
+    /// point, so deleting `typed + late` characters and retyping restores a
+    /// consistent text.
+    fn repair_interleaved(
+        &mut self,
+        plan: &CorrectionPlan,
+        typed: &mut String,
+        keys: &mut Vec<PendingKey>,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut repairs = 0;
+        loop {
+            std::thread::sleep(CAPTURE_LAG);
+            let start = keys.len();
+            self.collect_pending(keys)?;
+            let late = match tail_text(&keys[start..], plan.layout.table()) {
+                Ok(late) if late.is_empty() => return Ok(()),
+                Ok(late) if repairs < MAX_REPAIRS && !self.evdev_modifiers.any_held() => late,
+                _ => {
+                    eprintln!(
+                        "layoutpilot: input during correction could not be repaired; \
+                         check the text"
+                    );
+                    self.manager.reset(ResetReason::Manual);
+                    return Ok(());
+                }
+            };
+            let late_len = late.chars().count();
+            self.injector
+                .tap_backspace(typed.chars().count() + late_len)?;
+            typed.push_str(&late);
+            self.injector.tap_text(typed, plan.layout.table())?;
+            self.remember_own_events();
+            repairs += 1;
+            println!("layoutpilot: repaired {late_len} chars typed during correction");
+        }
+    }
+
+    /// Move pending physical keys (backlog first, then capture) into `keys`,
+    /// waiting briefly for held modifiers to be released.
+    fn collect_pending(&mut self, keys: &mut Vec<PendingKey>) -> Result<(), Box<dyn Error>> {
+        keys.extend(self.backlog.drain(..));
+        while let Some(event) = self.capture.try_recv()? {
+            keys.extend(self.normalize(event));
+        }
+        let deadline = Instant::now() + MODIFIER_RELEASE_WAIT;
+        while self.evdev_modifiers.any_held() && Instant::now() < deadline {
+            if let Some(event) = self.capture.recv_timeout(Duration::from_millis(5))? {
+                keys.extend(self.normalize(event));
+            }
+        }
+        Ok(())
+    }
+
+    /// Abandon a plan before anything was injected and process the keys as
+    /// ordinary input.
+    fn skip_plan(&mut self, reason: &str, keys: Vec<PendingKey>) {
+        println!("layoutpilot: correction skipped: {reason}");
+        self.manager.reset(ResetReason::Manual);
+        self.backlog.extend(keys);
+    }
+
+    fn remember_own_events(&mut self) {
+        self.ignore.extend(self.injector.take_sent_events());
+        self.ignore_until = Instant::now() + IGNORE_WINDOW;
     }
 
     fn consume_own(&mut self, event: &KeyEvent) -> bool {

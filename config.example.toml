@@ -4,7 +4,7 @@
 [general]
 enabled = true
 languages = ["ru", "en"]
-triggers = ["space", "enter"]      # space | punct | tab | enter
+triggers = ["space"]               # space | punct | tab | enter (enter — опасно, см. docs/config.md)
 min_word_len = 3
 confidence_threshold = 0.97
 undo_hotkey = "Pause"

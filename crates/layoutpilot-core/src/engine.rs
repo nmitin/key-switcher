@@ -5,7 +5,7 @@
 //! every rule is testable on any host.
 //!
 //! Trigger policy (FR-01, ADR-001): space and closing punctuation. Enter is
-//! never a trigger. Tab is a trigger only in the `aggressive` profile when
+//! an opt-in trigger (`enter_trigger`, off by default). Tab is a trigger only in the `aggressive` profile when
 //! explicitly enabled. The apostrophe is treated as a word character, not a
 //! trigger, so `don't` stays one word.
 
