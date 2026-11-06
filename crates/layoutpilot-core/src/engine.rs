@@ -13,7 +13,7 @@ use layoutpilot_layouts::{LayoutId, LayoutTable};
 
 use crate::buffer::CharBuffer;
 use crate::conversion::{convert_phrase, reinterpret_word, split_trailing_suffix};
-use crate::detector::{DetectionContext, Detector};
+use crate::detector::{DetectionContext, Detector, Learning};
 use crate::profile::{EngineConfig, Profile};
 use crate::protection::{is_protected_context, is_protected_token};
 use crate::segmenter::{is_word_char, last_word};
@@ -228,6 +228,8 @@ pub enum ResetReason {
 struct UndoRecord {
     correction: Correction,
     applied: bool,
+    /// Made by a gesture/hotkey rather than automatically.
+    manual: bool,
 }
 
 /// The correction state machine.
@@ -241,6 +243,8 @@ pub struct Engine<D: Detector> {
     next_word_attached: bool,
     /// The early trigger already fired for the current word.
     early_fired: bool,
+    /// Learning events not yet taken by the caller for persistence.
+    learned: Vec<Learning>,
     paused: bool,
     undo: Option<UndoRecord>,
     last_reset: Option<ResetReason>,
@@ -258,6 +262,7 @@ impl<D: Detector> Engine<D> {
             word_tainted: false,
             next_word_attached: false,
             early_fired: false,
+            learned: Vec::new(),
             paused: false,
             undo: None,
             last_reset: None,
@@ -498,7 +503,11 @@ impl<D: Detector> Engine<D> {
         self.undo = self.config.undo_enabled.then(|| UndoRecord {
             correction: correction.clone(),
             applied: true,
+            manual: true,
         });
+        for word in word_cores(&correction.converted) {
+            self.record(Learning::Accept(word));
+        }
         Some(correction)
     }
 
@@ -512,6 +521,7 @@ impl<D: Detector> Engine<D> {
         }
         let correction = self.undo.as_ref()?.correction.clone();
         let applied = self.undo.as_ref()?.applied;
+        let manual = self.undo.as_ref()?.manual;
         let (from, to) = if applied {
             (&correction.converted, &correction.original)
         } else {
@@ -529,6 +539,16 @@ impl<D: Detector> Engine<D> {
 
         if let Some(record) = self.undo.as_mut() {
             record.applied = !applied;
+        }
+        if applied {
+            if manual {
+                for word in word_cores(&correction.converted) {
+                    self.record(Learning::Retract(word));
+                }
+            } else if let Some(word) = word_cores(&correction.original).pop() {
+                // The word that triggered the correction is the one to keep.
+                self.record(Learning::Keep(word));
+            }
         }
         if applied {
             Some(Action::Undo(correction))
@@ -647,7 +667,15 @@ impl<D: Detector> Engine<D> {
         self.undo = self.config.undo_enabled.then(|| UndoRecord {
             correction: correction.clone(),
             applied: true,
+            manual: false,
         });
+        if self.early_fired {
+            // The early guess was wrong and the finished word goes back:
+            // remember it so its prefix does not fire again.
+            if let Some(word) = word_cores(&correction.converted).pop() {
+                self.record(Learning::Keep(word));
+            }
+        }
         Some(Action::Replace(correction))
     }
 }
@@ -662,6 +690,20 @@ impl<D: Detector> Engine<D> {
     /// first word that does not qualify, at a line break or at sentence
     /// punctuation. Words that were corrected earlier are already in the
     /// target script and cannot be reinterpreted, so they stop it too.
+    /// Learning events since the last call, for persistence. They are
+    /// already applied to the detector.
+    pub fn take_learning(&mut self) -> Vec<Learning> {
+        std::mem::take(&mut self.learned)
+    }
+
+    fn record(&mut self, event: Learning) {
+        if !self.config.learning {
+            return;
+        }
+        self.detector.learn(&event);
+        self.learned.push(event);
+    }
+
     /// Correct the unfinished word if its prefix cannot start a word of the
     /// current language but commonly starts one in the other. The rest of the
     /// word is then typed directly in the right layout. If the guess was
@@ -719,6 +761,7 @@ impl<D: Detector> Engine<D> {
         self.undo = self.config.undo_enabled.then(|| UndoRecord {
             correction: correction.clone(),
             applied: true,
+            manual: false,
         });
         Some(Action::Replace(correction))
     }
@@ -778,6 +821,14 @@ impl<D: Detector> Engine<D> {
         });
         (confidence >= self.config.lookback_threshold).then_some(candidate)
     }
+}
+
+/// Lowercase word cores of `text` (trailing punctuation dropped).
+fn word_cores(text: &str) -> Vec<String> {
+    text.split_whitespace()
+        .map(|token| split_trailing_suffix(token).0.to_lowercase())
+        .filter(|core| core.chars().any(char::is_alphabetic))
+        .collect()
 }
 
 fn is_punctuation(ch: char) -> bool {
@@ -982,6 +1033,88 @@ mod tests {
         // `hel` starts `hello`: still possible in English.
         let mut engine = Engine::new(early_config(), detector());
         assert_eq!(type_text(&mut engine, "hell", &auto()), None);
+    }
+
+    fn keep(word: &str) -> Learning {
+        Learning::Keep(word.to_owned())
+    }
+
+    #[test]
+    fn undo_of_an_automatic_correction_keeps_the_typed_word() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "ghbdtn ", &auto());
+        assert!(engine.take_learning().is_empty());
+        assert!(matches!(engine.undo(), Some(Action::Undo(_))));
+        assert_eq!(engine.take_learning(), vec![keep("ghbdtn")]);
+        // Redo does not teach anything new; the journal is drained.
+        assert!(matches!(engine.undo(), Some(Action::Redo(_))));
+        assert!(engine.take_learning().is_empty());
+    }
+
+    #[test]
+    fn undo_of_a_phrase_keeps_only_the_anchor() {
+        let mut engine = Engine::new(EngineConfig::default(), phrase_detector());
+        type_text(&mut engine, "f jy yt ghbitk ", &auto());
+        engine.undo();
+        assert_eq!(engine.take_learning(), vec![keep("ghbitk")]);
+    }
+
+    #[test]
+    fn manual_fix_accepts_and_its_undo_retracts() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        let manual = InputContext::new(Profile::Manual, LayoutId::Us);
+        type_text(&mut engine, "vbh", &manual);
+        engine.fix_last_word(&manual).expect("fix");
+        assert_eq!(
+            engine.take_learning(),
+            vec![Learning::Accept("мир".to_owned())]
+        );
+        engine.undo();
+        assert_eq!(
+            engine.take_learning(),
+            vec![Learning::Retract("мир".to_owned())]
+        );
+    }
+
+    /// Lexicon detector whose early guess always fires — to model a wrong
+    /// guess on a word missing from the dictionaries.
+    struct EagerDetector(LexiconDetector);
+
+    impl Detector for EagerDetector {
+        fn confidence(&self, context: &DetectionContext<'_>) -> f32 {
+            self.0.confidence(context)
+        }
+
+        fn early_confidence(&self, _typed: &str, _candidate: &str) -> f32 {
+            1.0
+        }
+    }
+
+    #[test]
+    fn a_reverted_early_guess_is_kept() {
+        let mut words = detector();
+        words.insert("ghbdvbh");
+        let mut engine = Engine::new(early_config(), EagerDetector(words));
+        replace(type_text(&mut engine, "ghbd", &auto()));
+        assert!(engine.take_learning().is_empty());
+        // The user finishes a word that only exists in English; the space
+        // check converts it back and remembers it.
+        let ru = InputContext::new(Profile::Auto, LayoutId::Ru);
+        let correction = replace(type_text(&mut engine, "мир ", &ru));
+        assert_eq!(correction.converted, "ghbdvbh");
+        assert_eq!(engine.take_learning(), vec![keep("ghbdvbh")]);
+    }
+
+    #[test]
+    fn learning_can_be_disabled() {
+        let config = EngineConfig {
+            learning: false,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config, detector());
+        type_text(&mut engine, "ghbdtn ", &auto());
+        engine.undo();
+        assert!(engine.take_learning().is_empty());
     }
 
     #[test]

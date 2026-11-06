@@ -25,7 +25,7 @@ pub use buffer::CharBuffer;
 pub use conversion::{
     convert_last_word, convert_text, convert_word, reinterpret, ConversionError, LastWordConversion,
 };
-pub use detector::{DetectionContext, Detector, LexiconDetector, StaticDetector};
+pub use detector::{DetectionContext, Detector, Learning, LexiconDetector, StaticDetector};
 pub use engine::{Action, Correction, Engine, EngineState, InputContext, Modifiers, ResetReason};
 pub use layoutpilot_layouts::{Keystroke, LayoutId, LayoutTable};
 pub use manager::{CorrectionManager, CorrectionPlan, PlanKind};

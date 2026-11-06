@@ -247,3 +247,51 @@ fn early_trigger_detector_needs_an_impossible_prefix() {
     assert!(detector.early_confidence_for("руддщ", "hello") > 0.9);
     assert!(detector.early_confidence_for("прив", "ghbd") < 0.1);
 }
+
+#[test]
+fn undone_word_is_not_corrected_again() {
+    let mut engine = engine();
+    let us = context(Profile::Auto, LayoutId::Us);
+    replacement(type_text(&mut engine, "ghbdtn ", &us));
+    engine.undo();
+    assert_eq!(
+        engine.take_learning(),
+        vec![layoutpilot_core::Learning::Keep("ghbdtn".to_owned())]
+    );
+    assert_eq!(type_text(&mut engine, "ghbdtn ", &us), None);
+    // Other words are still corrected.
+    replacement(type_text(&mut engine, "vbh ", &us));
+}
+
+#[test]
+fn undone_early_prefix_does_not_fire_again() {
+    let config = EngineConfig {
+        early_trigger: true,
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::new(config, DictionaryDetector::new());
+    let us = context(Profile::Auto, LayoutId::Us);
+    let correction = replacement(type_text(&mut engine, "ghbd", &us));
+    assert_eq!(correction.converted, "прив");
+    engine.undo();
+    assert_eq!(type_text(&mut engine, " ghbd", &us), None);
+}
+
+#[test]
+fn learning_survives_a_replay() {
+    use layoutpilot_core::Learning;
+    let mut detector = DictionaryDetector::new();
+    for event in [
+        Learning::Keep("ghbdtn".to_owned()),
+        Learning::Accept("ghbdtn".to_owned()),
+        Learning::Keep("rjulf".to_owned()),
+    ] {
+        detector.apply_learning(&event);
+    }
+    // Accept lifts an earlier Keep.
+    assert!(!detector.is_kept("ghbdtn"));
+    assert!(detector.is_kept("rjulf"));
+    assert!(detector.confidence_for("rjulf", "когда") < 0.01);
+    assert!(detector.early_confidence_for("rjul", "когд") < 0.01);
+    assert_eq!(detector.learned_counts(), (1, 1));
+}

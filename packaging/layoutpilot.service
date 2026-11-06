@@ -13,6 +13,9 @@ Restart=on-failure
 RestartSec=2
 RuntimeDirectory=layoutpilot
 RuntimeDirectoryMode=0700
+# Learning journal: ~/.local/state/layoutpilot/learned.tsv
+StateDirectory=layoutpilot
+StateDirectoryMode=0700
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict

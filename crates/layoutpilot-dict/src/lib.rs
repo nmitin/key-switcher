@@ -17,11 +17,11 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use fst::automaton::Str;
 use fst::{Automaton, IntoStreamer, Map, Streamer};
-use layoutpilot_core::{DetectionContext, Detector};
+use layoutpilot_core::{DetectionContext, Detector, Learning};
 
 #[allow(missing_docs)]
 mod data {
@@ -211,6 +211,8 @@ pub struct DictionaryDetector {
     en: LanguageModel,
     config: ScoringConfig,
     user: HashMap<String, u32>,
+    /// Words the user kept after undoing a correction.
+    keep: HashSet<String>,
 }
 
 impl DictionaryDetector {
@@ -238,6 +240,7 @@ impl DictionaryDetector {
             ),
             config,
             user: HashMap::new(),
+            keep: HashSet::new(),
         }
     }
 
@@ -286,6 +289,36 @@ impl DictionaryDetector {
         }
     }
 
+    /// Never convert `word` again and do not fire the early trigger on its
+    /// prefixes.
+    pub fn keep(&mut self, word: &str) {
+        self.keep.insert(word.to_lowercase());
+    }
+
+    /// Whether `word` is on the keep list.
+    #[must_use]
+    pub fn is_kept(&self, word: &str) -> bool {
+        self.keep.contains(&word.to_lowercase())
+    }
+
+    /// Number of kept words and of user-confirmed words.
+    #[must_use]
+    pub fn learned_counts(&self) -> (usize, usize) {
+        (self.keep.len(), self.user.len())
+    }
+
+    /// Apply a learning event.
+    pub fn apply_learning(&mut self, event: &Learning) {
+        match event {
+            Learning::Keep(word) => self.keep(word),
+            Learning::Accept(word) => {
+                self.keep.remove(&word.to_lowercase());
+                self.learn(word);
+            }
+            Learning::Retract(word) => self.unlearn(word),
+        }
+    }
+
     /// Number of user confirmations for a word.
     #[must_use]
     pub fn user_count(&self, word: &str) -> u32 {
@@ -297,6 +330,9 @@ impl DictionaryDetector {
     pub fn confidence_for(&self, typed: &str, candidate: &str) -> f32 {
         if typed == candidate {
             return 0.5;
+        }
+        if self.is_kept(typed) {
+            return 0.0;
         }
 
         let Some(candidate_language) = language_of(candidate) else {
@@ -346,6 +382,7 @@ impl DictionaryDetector {
         let candidate = candidate.to_lowercase();
         if self.model(source).has_prefix(&typed)
             || self.user.keys().any(|word| word.starts_with(&typed))
+            || self.keep.iter().any(|word| word.starts_with(&typed))
         {
             return 0.0;
         }
@@ -380,6 +417,10 @@ impl Detector for DictionaryDetector {
 
     fn early_confidence(&self, typed: &str, candidate: &str) -> f32 {
         self.early_confidence_for(typed, candidate)
+    }
+
+    fn learn(&mut self, event: &Learning) {
+        self.apply_learning(event);
     }
 }
 

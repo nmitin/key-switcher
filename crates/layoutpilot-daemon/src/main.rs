@@ -8,6 +8,7 @@
 //! and falls back to built-in defaults.
 
 mod kde_focus;
+mod learned;
 mod tail;
 mod tray;
 
@@ -527,6 +528,8 @@ struct Daemon {
     /// Runtime override from the tray: `manual` apps (terminals) become `auto`.
     terminals_auto: bool,
     focus_changed_at: Option<Instant>,
+    /// Learning journal, when `privacy.learning` is on.
+    learned_path: Option<PathBuf>,
     dry_run: bool,
 }
 
@@ -603,8 +606,12 @@ impl Daemon {
             tray: None,
             terminals_auto: false,
             focus_changed_at: None,
+            learned_path: None,
             dry_run,
         };
+        if daemon.config.privacy.learning {
+            daemon.load_learning();
+        }
         if daemon.config.general.tray {
             let state = TrayState {
                 pause_hotkey: daemon.config.general.pause_hotkey.clone(),
@@ -640,6 +647,7 @@ impl Daemon {
                 self.ignore.clear();
             }
 
+            self.persist_learning();
             if let Some(key) = self.backlog.pop_front() {
                 self.dispatch(key)?;
                 continue;
@@ -937,6 +945,44 @@ impl Daemon {
                 println!("layoutpilot: no phrase to fix");
                 Ok(false)
             }
+        }
+    }
+
+    fn load_learning(&mut self) {
+        let Some(path) = learned::path() else {
+            eprintln!("layoutpilot: learning disabled: no state directory");
+            return;
+        };
+        match learned::load(&path) {
+            Ok(events) => {
+                let detector = self.manager.engine_mut().detector_mut();
+                for event in &events {
+                    detector.apply_learning(event);
+                }
+                let (kept, accepted) = detector.learned_counts();
+                println!(
+                    "layoutpilot: learning from {} ({kept} kept, {accepted} confirmed)",
+                    path.display()
+                );
+            }
+            Err(error) => eprintln!("layoutpilot: cannot read {}: {error}", path.display()),
+        }
+        self.learned_path = Some(path);
+    }
+
+    /// Write learning events produced since the last call.
+    fn persist_learning(&mut self) {
+        let events = self.manager.engine_mut().take_learning();
+        if events.is_empty() || self.dry_run {
+            return;
+        }
+        let Some(path) = self.learned_path.as_deref() else {
+            return;
+        };
+        match learned::append(path, &events) {
+            // Counts only: the words themselves stay out of the journal.
+            Ok(()) => println!("layoutpilot: learned {} event(s)", events.len()),
+            Err(error) => eprintln!("layoutpilot: cannot write {}: {error}", path.display()),
         }
     }
 
@@ -1686,12 +1732,35 @@ fn doctor(config: &Config, path: Option<&PathBuf>) -> Result<(), Box<dyn Error>>
         }
     }
 
-    let detector = DictionaryDetector::new();
+    let mut detector = DictionaryDetector::new();
     println!(
         "dictionary: ru(привет)={}, en(hello)={}",
         detector.dict_count(Language::Ru, "привет"),
         detector.dict_count(Language::En, "hello")
     );
+    if config.privacy.learning {
+        match learned::path() {
+            Some(path) => match learned::load(&path) {
+                Ok(events) => {
+                    for event in &events {
+                        detector.apply_learning(event);
+                    }
+                    let (kept, accepted) = detector.learned_counts();
+                    println!(
+                        "learning: {} ({kept} kept, {accepted} confirmed)",
+                        path.display()
+                    );
+                }
+                Err(error) => {
+                    println!("learning: cannot read {}: {error}", path.display());
+                    failures += 1;
+                }
+            },
+            None => println!("learning: no state directory"),
+        }
+    } else {
+        println!("learning: off");
+    }
 
     if failures == 0 {
         println!("result: ok");

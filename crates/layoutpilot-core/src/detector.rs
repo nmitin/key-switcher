@@ -20,6 +20,20 @@ pub struct DetectionContext<'a> {
     pub previous_word: Option<&'a str>,
 }
 
+/// What the user taught by reacting to a correction.
+///
+/// Words are lowercase cores without trailing punctuation.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum Learning {
+    /// The user undid a correction: never convert this typed word, and do
+    /// not start an early correction on a prefix of it.
+    Keep(String),
+    /// The user converted this word by hand: it is a real word.
+    Accept(String),
+    /// The user rolled back their own manual fix: forget the `Accept`.
+    Retract(String),
+}
+
 /// Returns `P(candidate is intended)` in `[0, 1]`.
 pub trait Detector: Send + Sync {
     /// Calibrated confidence that the candidate should replace the typed word.
@@ -33,6 +47,9 @@ pub trait Detector: Send + Sync {
     fn early_confidence(&self, _typed: &str, _candidate: &str) -> f32 {
         0.0
     }
+
+    /// Apply a learning event. The default ignores it.
+    fn learn(&mut self, _event: &Learning) {}
 }
 
 /// A detector with a fixed confidence, useful in tests and as a default.

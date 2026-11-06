@@ -69,6 +69,8 @@ pub struct EngineConfig {
     pub early_trigger: bool,
     /// Minimum letters before the early trigger may fire (default 4).
     pub early_min_len: usize,
+    /// Learn from undo and manual fixes ([`crate::Learning`]).
+    pub learning: bool,
 }
 
 impl Default for EngineConfig {
@@ -90,6 +92,7 @@ impl Default for EngineConfig {
             lookback_threshold: 0.7,
             early_trigger: false,
             early_min_len: 4,
+            learning: true,
         }
     }
 }

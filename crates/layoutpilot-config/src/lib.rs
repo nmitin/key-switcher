@@ -597,6 +597,7 @@ impl Config {
             enter_trigger: self.general.triggers.contains(&Trigger::Enter),
             lookback_words: self.general.lookback_words,
             early_trigger: self.general.early_trigger,
+            learning: self.privacy.learning,
             ..EngineConfig::default()
         }
     }
