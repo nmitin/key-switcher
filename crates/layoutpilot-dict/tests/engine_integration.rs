@@ -146,3 +146,50 @@ fn manual_profile_uses_manual_fix() {
     let correction = engine.fix_last_word(&context).expect("manual fix");
     assert_eq!(correction.converted, "привет");
 }
+
+fn corrections(text: &str, layout: LayoutId) -> Vec<(String, String)> {
+    let mut engine = engine();
+    let context = context(Profile::Auto, layout);
+    text.chars()
+        .filter_map(|ch| match engine.on_char(ch, &context) {
+            Some(Action::Replace(correction)) => Some((correction.original, correction.converted)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn pair(original: &str, converted: &str) -> (String, String) {
+    (original.to_owned(), converted.to_owned())
+}
+
+#[test]
+fn short_words_before_a_corrected_word_are_converted_too() {
+    assert_eq!(
+        corrections("f jy yt ghbitk ", LayoutId::Us),
+        vec![pair("f jy yt ghbitk", "а он не пришел")]
+    );
+    assert_eq!(
+        corrections("b z nj;t ghbitk ", LayoutId::Us),
+        vec![pair("b z nj;t", "и я тоже"), pair("ghbitk", "пришел")]
+    );
+    assert_eq!(
+        corrections("шт еру ьщктштп ", LayoutId::Ru),
+        vec![pair("шт еру", "in the"), pair("ьщктштп", "morning")]
+    );
+}
+
+#[test]
+fn real_words_stop_the_lookback() {
+    for prefix in ["I", "a", "in", "ok", "to", "it", "the", "hello", "PR"] {
+        let found = corrections(&format!("{prefix} ghbdtn "), LayoutId::Us);
+        assert_eq!(found, vec![pair("ghbdtn", "привет")], "prefix {prefix}");
+    }
+    for prefix in ["и", "в", "я"] {
+        let found = corrections(&format!("{prefix} ыщьуерштп "), LayoutId::Ru);
+        assert_eq!(
+            found,
+            vec![pair("ыщьуерштп", "something")],
+            "prefix {prefix}"
+        );
+    }
+}

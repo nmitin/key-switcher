@@ -15,7 +15,7 @@ use crate::buffer::CharBuffer;
 use crate::conversion::{convert_phrase, reinterpret_word, split_trailing_suffix};
 use crate::detector::{DetectionContext, Detector};
 use crate::profile::{EngineConfig, Profile};
-use crate::protection::is_protected_context;
+use crate::protection::{is_protected_context, is_protected_token};
 use crate::segmenter::{is_word_char, last_word};
 
 /// Keyboard modifiers relevant to correction policy.
@@ -631,13 +631,87 @@ impl<D: Detector> Engine<D> {
             return None;
         }
 
-        self.buffer.replace_suffix(&self.current_word, &converted);
-        let correction = Correction::new(self.current_word.clone(), converted, Some(separator));
+        let head = text
+            .strip_suffix(self.current_word.as_str())
+            .unwrap_or(&text[..start]);
+        let (mut original, mut replacement) = self.lookback(head, context);
+        original.push_str(&self.current_word);
+        replacement.push_str(&converted);
+
+        self.buffer.replace_suffix(&original, &replacement);
+        let correction = Correction::new(original, replacement, Some(separator));
         self.undo = self.config.undo_enabled.then(|| UndoRecord {
             correction: correction.clone(),
             applied: true,
         });
         Some(Action::Replace(correction))
+    }
+}
+
+impl<D: Detector> Engine<D> {
+    /// Collect the words right before a confidently corrected one that were
+    /// typed in the same wrong layout but were too short (or too uncertain)
+    /// to be corrected on their own.
+    ///
+    /// `head` is the buffer before the corrected word. Returns the original
+    /// and converted text to prepend, spaces included. The walk stops at the
+    /// first word that does not qualify, at a line break or at sentence
+    /// punctuation. Words that were corrected earlier are already in the
+    /// target script and cannot be reinterpreted, so they stop it too.
+    fn lookback(&self, head: &str, context: &InputContext<'_>) -> (String, String) {
+        let mut original = String::new();
+        let mut converted = String::new();
+        let mut rest = head;
+        for _ in 0..self.config.lookback_words {
+            let trimmed = rest.trim_end_matches(' ');
+            let spaces = &rest[trimmed.len()..];
+            if spaces.is_empty() || trimmed.is_empty() {
+                break;
+            }
+            let token_start = trimmed
+                .rfind(char::is_whitespace)
+                .map_or(0, |index| index + 1);
+            let token = &trimmed[token_start..];
+            let Some(candidate) = self.lookback_candidate(token, context) else {
+                break;
+            };
+            original.insert_str(0, spaces);
+            original.insert_str(0, token);
+            converted.insert_str(0, spaces);
+            converted.insert_str(0, &candidate);
+            rest = &trimmed[..token_start];
+        }
+        (original, converted)
+    }
+
+    fn lookback_candidate(&self, token: &str, context: &InputContext<'_>) -> Option<String> {
+        if token.is_empty() || is_protected_token(token) {
+            return None;
+        }
+        if token.chars().any(|ch| ch.is_ascii_digit()) {
+            return None;
+        }
+        // Sentence punctuation ends the phrase.
+        let (_, suffix) = split_trailing_suffix(token);
+        if !suffix.is_empty() {
+            return None;
+        }
+        let target = context.active_layout.other();
+        let candidate =
+            reinterpret_word(token, context.active_layout.table(), target.table()).ok()?;
+        if candidate == token
+            || !candidate.chars().all(is_word_char)
+            || !target.table().can_type(&candidate)
+        {
+            return None;
+        }
+        let confidence = self.detector.confidence(&DetectionContext {
+            typed: token,
+            candidate: &candidate,
+            app_id: context.app_id,
+            previous_word: None,
+        });
+        (confidence >= self.config.lookback_threshold).then_some(candidate)
     }
 }
 
@@ -730,6 +804,72 @@ mod tests {
             Some(Action::Replace(correction)) => correction,
             other => panic!("expected Replace, got {other:?}"),
         }
+    }
+
+    fn phrase_detector() -> LexiconDetector {
+        LexiconDetector::from_words(["а", "он", "не", "пришел", "ok"])
+    }
+
+    #[test]
+    fn lookback_converts_short_words_with_the_corrected_one() {
+        let mut engine = Engine::new(EngineConfig::default(), phrase_detector());
+        let correction = replace(type_text(&mut engine, "f jy yt ghbitk ", &auto()));
+        assert_eq!(correction.original, "f jy yt ghbitk");
+        assert_eq!(correction.converted, "а он не пришел");
+        assert_eq!(correction.delete_chars(true), 15);
+        assert_eq!(engine.buffer_text(), "а он не пришел ");
+
+        // Undo restores the whole phrase.
+        assert!(matches!(engine.undo(), Some(Action::Undo(_))));
+        assert_eq!(engine.buffer_text(), "f jy yt ghbitk ");
+    }
+
+    #[test]
+    fn lookback_is_limited_and_can_be_disabled() {
+        let config = EngineConfig {
+            lookback_words: 1,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config, phrase_detector());
+        let correction = replace(type_text(&mut engine, "f jy yt ghbitk ", &auto()));
+        assert_eq!(correction.original, "yt ghbitk");
+
+        let config = EngineConfig {
+            lookback_words: 0,
+            ..EngineConfig::default()
+        };
+        let mut engine = Engine::new(config, phrase_detector());
+        let correction = replace(type_text(&mut engine, "f jy yt ghbitk ", &auto()));
+        assert_eq!(correction.original, "ghbitk");
+    }
+
+    #[test]
+    fn lookback_stops_at_boundaries() {
+        for (text, expected) in [
+            // A source-language word.
+            ("f ok yt ghbitk ", "yt ghbitk"),
+            // Sentence punctuation and line breaks.
+            ("f jy. yt ghbitk ", "yt ghbitk"),
+            ("f jy\nyt ghbitk ", "yt ghbitk"),
+            // Digits next to a word.
+            ("f 2jy yt ghbitk ", "yt ghbitk"),
+        ] {
+            let mut engine = Engine::new(EngineConfig::default(), phrase_detector());
+            let correction = replace(type_text(&mut engine, text, &auto()));
+            assert_eq!(correction.original, expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn lookback_does_not_reconvert_corrected_words() {
+        let mut engine = Engine::new(EngineConfig::default(), phrase_detector());
+        type_text(&mut engine, "ghbitk ", &auto());
+        assert_eq!(engine.buffer_text(), "пришел ");
+        // Still in `us` (no daemon here): the next correction must not touch
+        // the already converted word.
+        let correction = replace(type_text(&mut engine, "yt ghbitk ", &auto()));
+        assert_eq!(correction.original, "yt ghbitk");
+        assert_eq!(engine.buffer_text(), "пришел не пришел ");
     }
 
     #[test]

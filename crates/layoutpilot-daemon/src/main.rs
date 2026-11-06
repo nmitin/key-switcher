@@ -9,6 +9,7 @@
 
 mod kde_focus;
 mod tail;
+mod tray;
 
 use std::collections::{HashSet, VecDeque};
 use std::env;
@@ -24,7 +25,7 @@ use layoutpilot_config::{
     CaptureBackend, Config, DeleteMode, Hotkey, InjectBackend, LayoutBackend, Trigger,
 };
 use layoutpilot_core::{
-    CorrectionManager, CorrectionPlan, InputContext, LayoutId, LayoutTable, Profile,
+    CorrectionManager, CorrectionPlan, InputContext, LayoutId, LayoutTable, PlanKind, Profile,
     ProfileResolver, ResetReason,
 };
 use layoutpilot_dict::{DictionaryDetector, Language};
@@ -34,6 +35,7 @@ use layoutpilot_x11::{
     XRecordCapture,
 };
 use tail::{tail_text, Blocked, PendingKey};
+use tray::{TrayCommand, TrayHandle, TrayState};
 
 const BACKSPACE_KEYCODE: u8 = 22;
 const RETURN_KEYCODE: u8 = 36;
@@ -518,6 +520,7 @@ struct Daemon {
     evdev_modifiers: EvdevModifiers,
     shift_gesture: ShiftGesture,
     last_word_fix_at: Option<Instant>,
+    tray: Option<TrayHandle>,
     dry_run: bool,
 }
 
@@ -591,8 +594,19 @@ impl Daemon {
             evdev_modifiers: EvdevModifiers::default(),
             shift_gesture: ShiftGesture::default(),
             last_word_fix_at: None,
+            tray: None,
             dry_run,
         };
+        if daemon.config.general.tray {
+            let state = TrayState {
+                pause_hotkey: daemon.config.general.pause_hotkey.clone(),
+                ..TrayState::default()
+            };
+            match TrayHandle::spawn(state) {
+                Ok(tray) => daemon.tray = Some(tray),
+                Err(error) => eprintln!("layoutpilot: tray icon unavailable: {error}"),
+            }
+        }
         daemon.refresh_focus(true);
         Ok(daemon)
     }
@@ -610,6 +624,10 @@ impl Daemon {
         );
         loop {
             self.poll_hotkeys()?;
+            if !self.poll_tray() {
+                println!("layoutpilot: quit from tray");
+                break;
+            }
             if Instant::now() >= self.ignore_until && !self.ignore.is_empty() {
                 self.ignore.clear();
             }
@@ -914,6 +932,40 @@ impl Daemon {
         }
     }
 
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        if self.paused {
+            self.manager.pause();
+            self.shift_gesture.reset();
+            println!("layoutpilot: paused");
+        } else {
+            self.manager.resume();
+            println!("layoutpilot: resumed");
+        }
+        if let Some(tray) = self.tray.as_mut() {
+            tray.set_paused(self.paused);
+        }
+        let _ = std::io::stdout().flush();
+    }
+
+    /// Handle tray commands; returns `false` when the daemon should exit.
+    fn poll_tray(&mut self) -> bool {
+        let Some(tray) = self.tray.as_mut() else {
+            return true;
+        };
+        tray.tick();
+        let Some(command) = tray.try_command() else {
+            return true;
+        };
+        match command {
+            TrayCommand::TogglePause => {
+                self.toggle_pause();
+                true
+            }
+            TrayCommand::Quit => false,
+        }
+    }
+
     fn handle_hotkey(
         &mut self,
         action: HotkeyAction,
@@ -926,16 +978,7 @@ impl Daemon {
         }
         self.last_hotkey = Some((action, Instant::now()));
         match action {
-            HotkeyAction::Pause => {
-                self.paused = !self.paused;
-                if self.paused {
-                    self.manager.pause();
-                    println!("layoutpilot: paused");
-                } else {
-                    self.manager.resume();
-                    println!("layoutpilot: resumed");
-                }
-            }
+            HotkeyAction::Pause => self.toggle_pause(),
             HotkeyAction::Undo => {
                 if self.paused {
                     return Ok(());
@@ -1110,10 +1153,25 @@ impl Daemon {
             tail_len
         );
 
+        self.show_correction(&plan);
         self.repair_interleaved(&plan, &mut typed, &mut keys)?;
         // Feed the tail to the engine; it is now text in the target layout.
         self.backlog.extend(keys);
         Ok(())
+    }
+
+    fn show_correction(&mut self, plan: &CorrectionPlan) {
+        let Some(tray) = self.tray.as_mut() else {
+            return;
+        };
+        let Some(correction) = self.manager.last_correction() else {
+            return;
+        };
+        let (typed, converted) = match plan.kind {
+            PlanKind::Undo => (&correction.converted, &correction.original),
+            PlanKind::Replace | PlanKind::Redo => (&correction.original, &correction.converted),
+        };
+        tray.correction(typed, converted);
     }
 
     /// Keys pressed while the replacement was being typed landed somewhere

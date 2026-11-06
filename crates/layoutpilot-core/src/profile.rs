@@ -57,6 +57,13 @@ pub struct EngineConfig {
     pub buffer_capacity: usize,
     /// Whether corrections can be undone.
     pub undo_enabled: bool,
+    /// How many preceding words an automatic correction may take along
+    /// (`f jy yt ghbitk` → `а он не пришел`); 0 disables the lookback.
+    pub lookback_words: usize,
+    /// Confidence a preceding word needs to be converted together with a
+    /// confidently corrected word. Lower than the main threshold: the
+    /// corrected word already proves the layout was wrong.
+    pub lookback_threshold: f32,
 }
 
 impl Default for EngineConfig {
@@ -74,6 +81,8 @@ impl Default for EngineConfig {
             enter_trigger: false,
             buffer_capacity: 256,
             undo_enabled: true,
+            lookback_words: 4,
+            lookback_threshold: 0.7,
         }
     }
 }

@@ -231,6 +231,10 @@ pub struct GeneralConfig {
     pub double_shift_fix: bool,
     /// Triple Shift fixes the whole current phrase.
     pub triple_shift_phrase: bool,
+    /// Preceding short words converted together with a corrected word.
+    pub lookback_words: usize,
+    /// Show a system tray icon (pause/resume, correction indicator).
+    pub tray: bool,
 }
 
 impl Default for GeneralConfig {
@@ -249,6 +253,8 @@ impl Default for GeneralConfig {
             backspace_undo: true,
             double_shift_fix: true,
             triple_shift_phrase: true,
+            lookback_words: 4,
+            tray: true,
         }
     }
 }
@@ -586,6 +592,7 @@ impl Config {
             space_trigger: self.general.triggers.contains(&Trigger::Space),
             punct_trigger: self.general.triggers.contains(&Trigger::Punct),
             enter_trigger: self.general.triggers.contains(&Trigger::Enter),
+            lookback_words: self.general.lookback_words,
             ..EngineConfig::default()
         }
     }

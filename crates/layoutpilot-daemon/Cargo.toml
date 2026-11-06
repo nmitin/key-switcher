@@ -15,6 +15,7 @@ layoutpilot-dict = { path = "../layoutpilot-dict" }
 layoutpilot-inject = { path = "../layoutpilot-inject" }
 layoutpilot-x11 = { path = "../layoutpilot-x11" }
 zbus = "4"
+ksni = { version = "0.3.7", default-features = false, features = ["async-io", "blocking"] }
 
 [[bin]]
 name = "layoutpilot"
