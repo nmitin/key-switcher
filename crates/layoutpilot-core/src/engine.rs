@@ -9,10 +9,10 @@
 //! explicitly enabled. The apostrophe is treated as a word character, not a
 //! trigger, so `don't` stays one word.
 
-use layoutpilot_layouts::LayoutId;
+use layoutpilot_layouts::{LayoutId, LayoutTable};
 
 use crate::buffer::CharBuffer;
-use crate::conversion::reinterpret_word;
+use crate::conversion::{convert_phrase, reinterpret_word, split_trailing_suffix};
 use crate::detector::{DetectionContext, Detector};
 use crate::profile::{EngineConfig, Profile};
 use crate::protection::is_protected_context;
@@ -117,8 +117,13 @@ pub struct Correction {
     pub converted: String,
     /// Separator that triggered the correction, if any.
     pub separator: Option<char>,
-    /// Number of characters in the original word.
+    /// Number of characters in the original word or phrase.
     pub word_chars: usize,
+    /// Characters after the replacement that must stay untouched.
+    ///
+    /// Manual gestures may fire after a space. The trailing space is kept in
+    /// place instead of being deleted and retyped.
+    pub trailing: String,
 }
 
 impl Correction {
@@ -129,6 +134,7 @@ impl Correction {
             converted,
             separator,
             word_chars,
+            trailing: String::new(),
         }
     }
 
@@ -388,23 +394,29 @@ impl<D: Detector> Engine<D> {
         }
     }
 
-    /// Manually convert the word currently being typed (FR-03).
+    /// Manually convert the last word (FR-03).
     ///
     /// This bypasses the minimum length and confidence checks, but still needs
     /// a trustworthy layout and a reversible word. It is available in the
-    /// `manual` profile and while an IME is active.
+    /// `manual` profile and while an IME is active. If no word is being typed,
+    /// the last completed word in the current line is used, so the gesture
+    /// works after a space as well.
     pub fn fix_last_word(&mut self, context: &InputContext<'_>) -> Option<Correction> {
         if self.paused
             || context.profile == Profile::Off
             || !context.layout_trusted
-            || self.current_word.is_empty()
             || self.word_tainted
         {
             return None;
         }
 
         let target = context.active_layout.other();
-        let (core, suffix) = split_trailing_suffix(&self.current_word);
+        let (original, trailing) = if self.current_word.is_empty() {
+            self.last_typed_token()?
+        } else {
+            (self.current_word.clone(), String::new())
+        };
+        let (core, suffix) = split_trailing_suffix(&original);
         if core.is_empty() {
             return None;
         }
@@ -412,12 +424,70 @@ impl<D: Detector> Engine<D> {
             reinterpret_word(core, context.active_layout.table(), target.table()).ok()?;
         let mut converted = converted_core;
         converted.push_str(suffix);
-        if converted == self.current_word || !target.table().can_type(&converted) {
+        if converted == original || !target.table().can_type(&converted) {
             return None;
         }
 
-        self.buffer.replace_suffix(&self.current_word, &converted);
-        let correction = Correction::new(self.current_word.clone(), converted, None);
+        self.apply_manual(original, converted, trailing)
+    }
+
+    /// Manually convert the current phrase (words separated by spaces).
+    ///
+    /// The phrase is the text since the last sentence boundary or newline, so
+    /// a triple Shift can flip a whole mistyped sentence while leaving earlier
+    /// text alone. Trailing spaces are preserved and the `manual`/`off` profile
+    /// rules are the same as for [`Self::fix_last_word`].
+    pub fn fix_last_phrase(&mut self, context: &InputContext<'_>) -> Option<Correction> {
+        if self.paused || context.profile == Profile::Off || !context.layout_trusted {
+            return None;
+        }
+
+        let target = context.active_layout.other();
+        let text = self.buffer.text();
+        let (start, end) = phrase_bounds(&text)?;
+        let original = text[start..end].to_owned();
+        let trailing = text[end..].to_owned();
+        let converted =
+            convert_phrase(&original, context.active_layout.table(), target.table()).ok()?;
+        if converted == original || !can_type_manual(&converted, target.table()) {
+            return None;
+        }
+
+        self.apply_manual(original, converted, trailing)
+    }
+
+    fn last_typed_token(&self) -> Option<(String, String)> {
+        let text = self.buffer.text();
+        let line_start = text.rfind(['\n', '\t']).map_or(0, |index| index + 1);
+        let line = &text[line_start..];
+        let end = line.trim_end_matches(' ').len();
+        if end == 0 {
+            return None;
+        }
+        let region = &line[..end];
+        let start = region.rfind(' ').map_or(0, |index| index + 1);
+        if start >= region.len() {
+            return None;
+        }
+        Some((region[start..].to_owned(), line[end..].to_owned()))
+    }
+
+    fn apply_manual(
+        &mut self,
+        original: String,
+        converted: String,
+        trailing: String,
+    ) -> Option<Correction> {
+        let mut suffix = original.clone();
+        suffix.push_str(&trailing);
+        let mut replacement = converted.clone();
+        replacement.push_str(&trailing);
+        if !self.buffer.replace_suffix(&suffix, &replacement) {
+            return None;
+        }
+
+        let mut correction = Correction::new(original, converted, None);
+        correction.trailing = trailing;
         self.current_word.clear();
         self.word_tainted = false;
         self.next_word_attached = false;
@@ -449,6 +519,8 @@ impl<D: Detector> Engine<D> {
             from.push(separator);
             to.push(separator);
         }
+        from.push_str(&correction.trailing);
+        to.push_str(&correction.trailing);
         self.buffer.replace_suffix(&from, &to);
 
         if let Some(record) = self.undo.as_mut() {
@@ -581,23 +653,39 @@ fn punctuation_is_letter(ch: char, layout: LayoutId) -> bool {
         .is_some_and(char::is_alphabetic)
 }
 
-fn is_sentence_suffix(ch: char) -> bool {
-    matches!(
-        ch,
-        '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '!' | '?'
-    )
-}
-
-fn split_trailing_suffix(word: &str) -> (&str, &str) {
-    let mut split = word.len();
-    for (index, ch) in word.char_indices().rev() {
-        if is_sentence_suffix(ch) {
-            split = index;
+fn phrase_bounds(text: &str) -> Option<(usize, usize)> {
+    let mut start = 0;
+    let mut iter = text.char_indices().peekable();
+    while let Some((index, ch)) = iter.next() {
+        let boundary = if ch == '\n' || ch == '\t' {
+            true
+        } else if matches!(ch, '.' | '!' | '?' | ';' | ':') {
+            let followed_by_space = iter.peek().is_some_and(|(_, next)| next.is_whitespace());
+            let has_more_text = text[index + ch.len_utf8()..]
+                .chars()
+                .any(|next| next != ' ');
+            followed_by_space && has_more_text
         } else {
-            break;
+            false
+        };
+        if boundary {
+            start = index + ch.len_utf8();
         }
     }
-    word.split_at(split)
+
+    let mut end = text.len();
+    while end > start && text.as_bytes()[end - 1] == b' ' {
+        end -= 1;
+    }
+    while start < end && text.as_bytes()[start] == b' ' {
+        start += 1;
+    }
+    (start < end).then_some((start, end))
+}
+
+fn can_type_manual(text: &str, table: &LayoutTable) -> bool {
+    text.chars()
+        .all(|ch| ch == ' ' || table.keystroke_for(ch).is_some())
 }
 
 #[cfg(test)]
@@ -750,6 +838,65 @@ mod tests {
         assert_eq!(correction.converted, "привет");
         assert_eq!(correction.separator, None);
         assert!(engine.undo_available());
+    }
+
+    #[test]
+    fn manual_word_fix_works_after_a_space() {
+        let context = InputContext::new(Profile::Manual, LayoutId::Us);
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "ghbdtn ", &context);
+
+        let correction = engine.fix_last_word(&context).expect("last word");
+        assert_eq!(correction.original, "ghbdtn");
+        assert_eq!(correction.converted, "привет");
+        assert_eq!(correction.trailing, " ");
+        assert_eq!(correction.word_chars, 6);
+        assert_eq!(engine.buffer_text(), "привет ");
+        assert_eq!(engine.current_word(), "");
+
+        let undo = engine.undo().expect("undo");
+        assert!(matches!(undo, Action::Undo(_)));
+        assert_eq!(engine.buffer_text(), "ghbdtn ");
+    }
+
+    #[test]
+    fn manual_phrase_fix_converts_all_words() {
+        let context = InputContext::new(Profile::Manual, LayoutId::Us);
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "ghbdtn vbh ", &context);
+
+        let correction = engine.fix_last_phrase(&context).expect("phrase");
+        assert_eq!(correction.original, "ghbdtn vbh");
+        assert_eq!(correction.converted, "привет мир");
+        assert_eq!(correction.trailing, " ");
+        assert_eq!(engine.buffer_text(), "привет мир ");
+
+        let undo = engine.undo().expect("undo");
+        assert!(matches!(undo, Action::Undo(_)));
+        assert_eq!(engine.buffer_text(), "ghbdtn vbh ");
+    }
+
+    #[test]
+    fn phrase_fix_starts_after_the_last_sentence_boundary() {
+        let context = InputContext::new(Profile::Manual, LayoutId::Us);
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "ghbdtn. vbh ", &context);
+
+        let correction = engine.fix_last_phrase(&context).expect("phrase");
+        assert_eq!(correction.original, "vbh");
+        assert_eq!(correction.converted, "мир");
+        assert_eq!(engine.buffer_text(), "ghbdtn. мир ");
+    }
+
+    #[test]
+    fn phrase_fix_preserves_punctuation_between_words() {
+        let context = InputContext::new(Profile::Manual, LayoutId::Us);
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        type_text(&mut engine, "ghbdtn, vbh", &context);
+
+        let correction = engine.fix_last_phrase(&context).expect("phrase");
+        assert_eq!(correction.converted, "привет, мир");
+        assert_eq!(engine.buffer_text(), "привет, мир");
     }
 
     #[test]

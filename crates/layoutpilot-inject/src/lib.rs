@@ -26,6 +26,8 @@ pub const BACKSPACE_KEYCODE: u16 = 22;
 pub const RETURN_KEYCODE: u16 = 36;
 /// XKB keycode for Tab (evdev 15 + 8).
 pub const TAB_KEYCODE: u16 = 23;
+/// XKB keycode for Space (evdev 57 + 8).
+pub const SPACE_KEYCODE: u16 = 65;
 /// XKB keycode for left Shift (evdev 42 + 8).
 pub const SHIFT_KEYCODE: u16 = 50;
 
@@ -34,6 +36,7 @@ const EVDEV_KEY_LEFTCTRL: u16 = 29;
 const EVDEV_KEY_BACKSPACE: u16 = 14;
 const EVDEV_KEY_ENTER: u16 = 28;
 const EVDEV_KEY_TAB: u16 = 15;
+const EVDEV_KEY_SPACE: u16 = 57;
 const EVDEV_TO_XKB_OFFSET: u16 = 8;
 
 /// uinput injection error.
@@ -185,6 +188,7 @@ pub fn encode_text(text: &str, layout: &LayoutTable) -> Result<Vec<(u16, bool)>,
         match ch {
             '\n' => keys.push((EVDEV_KEY_ENTER + EVDEV_TO_XKB_OFFSET, false)),
             '\t' => keys.push((EVDEV_KEY_TAB + EVDEV_TO_XKB_OFFSET, false)),
+            ' ' => keys.push((EVDEV_KEY_SPACE + EVDEV_TO_XKB_OFFSET, false)),
             _ => {
                 let Keystroke { keycode, level } = layout
                     .keystroke_for(ch)
@@ -216,7 +220,7 @@ mod tests {
             vec![
                 (38, false),
                 (38, true),
-                (57, false),
+                (SPACE_KEYCODE, false),
                 (52, false),
                 (RETURN_KEYCODE, false),
                 (TAB_KEYCODE, false),

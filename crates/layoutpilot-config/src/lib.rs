@@ -227,8 +227,10 @@ pub struct GeneralConfig {
     pub sound_file: String,
     /// Treat Backspace after a correction as undo.
     pub backspace_undo: bool,
-    /// Double Shift fixes the last word (triple Shift is reserved for phrases).
+    /// Double Shift fixes the last word.
     pub double_shift_fix: bool,
+    /// Triple Shift fixes the whole current phrase.
+    pub triple_shift_phrase: bool,
 }
 
 impl Default for GeneralConfig {
@@ -246,6 +248,7 @@ impl Default for GeneralConfig {
             sound_file: "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga".to_owned(),
             backspace_undo: true,
             double_shift_fix: true,
+            triple_shift_phrase: true,
         }
     }
 }
@@ -635,6 +638,8 @@ mod tests {
         assert!(config.general.sound_on_layout_change);
         assert!(config.general.sound_file.contains("camera-shutter"));
         assert!(config.general.backspace_undo);
+        assert!(config.general.double_shift_fix);
+        assert!(config.general.triple_shift_phrase);
         assert_eq!(config.layout.backend, LayoutBackend::Auto);
         assert_eq!(config.layout.order, vec![LayoutCode::Us, LayoutCode::Ru]);
         assert!(!config.privacy.store_keystrokes);

@@ -95,7 +95,19 @@ impl Hotkeys {
 /// XKB keycodes for left and right Shift.
 const SHIFT_KEYCODES: [u8; 2] = [50, 62];
 
-/// Double Shift fixes the last word; any other key breaks the sequence.
+/// What a completed Shift sequence should fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShiftGestureAction {
+    /// Double Shift: the last word.
+    Word,
+    /// Triple Shift: the whole current phrase.
+    Phrase,
+}
+
+/// Double Shift fixes the last word, triple Shift the phrase.
+///
+/// Any other key breaks the sequence. The action fires on release so that no
+/// synthetic character is typed while a physical Shift is still held.
 #[derive(Debug)]
 struct ShiftGesture {
     count: u8,
@@ -122,8 +134,8 @@ impl ShiftGesture {
         self.broken = false;
     }
 
-    /// Feed one key event; returns true when the second Shift is released.
-    fn on_key(&mut self, keycode: u8, pressed: bool, now: Instant) -> bool {
+    /// Feed one key event; returns an action when a sequence is released.
+    fn on_key(&mut self, keycode: u8, pressed: bool, now: Instant) -> Option<ShiftGestureAction> {
         if SHIFT_KEYCODES.contains(&keycode) {
             if pressed {
                 self.count = if self
@@ -139,20 +151,20 @@ impl ShiftGesture {
             } else if self.broken {
                 self.reset();
             } else if self.count == 2 {
-                self.reset();
-                return true;
+                // Keep the counter: a third quick tap upgrades the gesture to
+                // a phrase. A new sequence after the window starts at 1.
+                return Some(ShiftGestureAction::Word);
             } else if self.count >= 3 {
-                // Phrases are not implemented yet; do not let a third tap
-                // leave the counter in a state where it fires later.
                 self.reset();
+                return Some(ShiftGestureAction::Phrase);
             }
-            return false;
+            return None;
         }
         if pressed {
             self.reset();
             self.broken = true;
         }
-        false
+        None
     }
 }
 
@@ -483,6 +495,7 @@ struct Daemon {
     enter_ignore_until: Instant,
     evdev_modifiers: EvdevModifiers,
     shift_gesture: ShiftGesture,
+    last_word_fix_at: Option<Instant>,
     dry_run: bool,
 }
 
@@ -554,6 +567,7 @@ impl Daemon {
             enter_ignore_until: Instant::now(),
             evdev_modifiers: EvdevModifiers::default(),
             shift_gesture: ShiftGesture::default(),
+            last_word_fix_at: None,
             dry_run,
         };
         daemon.refresh_focus(true);
@@ -634,12 +648,13 @@ impl Daemon {
             // Modifiers never reach handle_key, so feed the Shift gesture here.
             if self.paused {
                 self.shift_gesture.reset();
-            } else if self.config.general.double_shift_fix
-                && self
-                    .shift_gesture
-                    .on_key(keycode, event.pressed(), Instant::now())
-            {
-                self.manual_fix(&x11_event)?;
+            } else if self.config.general.double_shift_fix {
+                if let Some(action) =
+                    self.shift_gesture
+                        .on_key(keycode, event.pressed(), Instant::now())
+                {
+                    self.handle_shift_gesture(action, &x11_event)?;
+                }
             }
             return Ok(());
         }
@@ -657,14 +672,14 @@ impl Daemon {
             return Ok(());
         }
         if !event.pressed {
-            if self.config.general.double_shift_fix
-                && !self.paused
-                && self
-                    .shift_gesture
-                    .on_key(event.keycode, false, Instant::now())
-            {
-                self.manual_fix(&event)?;
-                return Ok(());
+            if self.config.general.double_shift_fix && !self.paused {
+                if let Some(action) =
+                    self.shift_gesture
+                        .on_key(event.keycode, false, Instant::now())
+                {
+                    self.handle_shift_gesture(action, &event)?;
+                    return Ok(());
+                }
             }
             if event.keycode == RETURN_KEYCODE && self.pending_enter {
                 self.pending_enter = false;
@@ -770,20 +785,78 @@ impl Daemon {
         Ok(())
     }
 
-    fn manual_fix(&mut self, event: &KeyEvent) -> Result<(), Box<dyn Error>> {
+    fn handle_shift_gesture(
+        &mut self,
+        action: ShiftGestureAction,
+        event: &KeyEvent,
+    ) -> Result<(), Box<dyn Error>> {
+        match action {
+            ShiftGestureAction::Word => {
+                if self.manual_fix_word(event)? {
+                    self.last_word_fix_at = Some(Instant::now());
+                }
+            }
+            ShiftGestureAction::Phrase if self.config.general.triple_shift_phrase => {
+                // A third tap arrives after the second one already fixed the
+                // word. Roll that fix back first so the phrase is converted
+                // from the text as the user typed it, not from a half-fixed
+                // buffer.
+                let undo_word = self
+                    .last_word_fix_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(800))
+                    && self.manager.undo_applied();
+                if undo_word {
+                    if let Some(plan) = self.manager.undo() {
+                        self.apply(plan)?;
+                    }
+                }
+                let applied = self.manual_fix_phrase(event)?;
+                if !applied && undo_word {
+                    if let Some(plan) = self.manager.undo() {
+                        self.apply(plan)?;
+                    }
+                }
+                self.last_word_fix_at = None;
+            }
+            ShiftGestureAction::Phrase => {}
+        }
+        Ok(())
+    }
+
+    fn manual_fix_word(&mut self, event: &KeyEvent) -> Result<bool, Box<dyn Error>> {
         if self.manager.undo_applied() {
             if let Some(plan) = self.manager.undo() {
                 self.apply(plan)?;
-                return Ok(());
+                return Ok(true);
             }
         }
         let app_id = self.app_id.clone();
         let context = self.context(event, app_id.as_deref());
         match self.manager.on_fix_last_word(&context) {
-            Some(plan) => self.apply(plan)?,
-            None => println!("layoutpilot: no word to fix"),
+            Some(plan) => {
+                self.apply(plan)?;
+                Ok(true)
+            }
+            None => {
+                println!("layoutpilot: no word to fix");
+                Ok(false)
+            }
         }
-        Ok(())
+    }
+
+    fn manual_fix_phrase(&mut self, event: &KeyEvent) -> Result<bool, Box<dyn Error>> {
+        let app_id = self.app_id.clone();
+        let context = self.context(event, app_id.as_deref());
+        match self.manager.on_fix_last_phrase(&context) {
+            Some(plan) => {
+                self.apply(plan)?;
+                Ok(true)
+            }
+            None => {
+                println!("layoutpilot: no phrase to fix");
+                Ok(false)
+            }
+        }
     }
 
     fn handle_hotkey(
@@ -1509,25 +1582,83 @@ mod tests {
     fn double_shift_gesture_fires_and_resets() {
         let start = Instant::now();
         let mut gesture = ShiftGesture::default();
-        assert!(!gesture.on_key(50, true, start));
-        assert!(!gesture.on_key(50, false, start + Duration::from_millis(20)));
-        assert!(!gesture.on_key(50, true, start + Duration::from_millis(40)));
-        assert!(gesture.on_key(50, false, start + Duration::from_millis(60)));
-        // The sequence is consumed, a third tap alone must not fire.
-        assert!(!gesture.on_key(50, true, start + Duration::from_millis(80)));
-        assert!(!gesture.on_key(50, false, start + Duration::from_millis(100)));
+        assert_eq!(gesture.on_key(50, true, start), None);
+        assert_eq!(
+            gesture.on_key(50, false, start + Duration::from_millis(20)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(50, true, start + Duration::from_millis(40)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(50, false, start + Duration::from_millis(60)),
+            Some(ShiftGestureAction::Word)
+        );
+        // After the gesture window a new tap starts a fresh sequence and does
+        // not turn the previous word gesture into a phrase.
+        assert_eq!(
+            gesture.on_key(50, true, start + Duration::from_millis(600)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(50, false, start + Duration::from_millis(620)),
+            None
+        );
+    }
+
+    #[test]
+    fn triple_shift_gesture_fires_phrase() {
+        let start = Instant::now();
+        let mut gesture = ShiftGesture::default();
+        assert_eq!(gesture.on_key(50, true, start), None);
+        assert_eq!(
+            gesture.on_key(50, false, start + Duration::from_millis(20)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(62, true, start + Duration::from_millis(40)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(62, false, start + Duration::from_millis(60)),
+            Some(ShiftGestureAction::Word)
+        );
+        assert_eq!(
+            gesture.on_key(50, true, start + Duration::from_millis(80)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(50, false, start + Duration::from_millis(100)),
+            Some(ShiftGestureAction::Phrase)
+        );
     }
 
     #[test]
     fn double_shift_gesture_breaks_on_other_key() {
         let start = Instant::now();
         let mut gesture = ShiftGesture::default();
-        assert!(!gesture.on_key(50, true, start));
-        assert!(!gesture.on_key(50, false, start + Duration::from_millis(20)));
-        assert!(!gesture.on_key(38, true, start + Duration::from_millis(30)));
-        assert!(!gesture.on_key(38, false, start + Duration::from_millis(40)));
-        assert!(!gesture.on_key(50, true, start + Duration::from_millis(50)));
-        assert!(!gesture.on_key(50, false, start + Duration::from_millis(60)));
+        assert_eq!(gesture.on_key(50, true, start), None);
+        assert_eq!(
+            gesture.on_key(50, false, start + Duration::from_millis(20)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(38, true, start + Duration::from_millis(30)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(38, false, start + Duration::from_millis(40)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(50, true, start + Duration::from_millis(50)),
+            None
+        );
+        assert_eq!(
+            gesture.on_key(50, false, start + Duration::from_millis(60)),
+            None
+        );
     }
 
     #[test]

@@ -271,6 +271,63 @@ pub fn reinterpret_word(
     Ok(output)
 }
 
+/// Convert a phrase made of space-separated words.
+///
+/// Every word is converted independently, so trailing sentence punctuation
+/// (`,` `.` `!` …) stays punctuation instead of turning into a letter on the
+/// target layout. Spaces and the exact number of spaces are preserved.
+///
+/// # Errors
+///
+/// See [`reinterpret_word`].
+pub fn convert_phrase(
+    text: &str,
+    source: &LayoutTable,
+    target: &LayoutTable,
+) -> Result<String, ConversionError> {
+    if text.is_empty() {
+        return Err(ConversionError::EmptyWord);
+    }
+
+    let mut output = String::with_capacity(text.len());
+    for (index, part) in text.split(' ').enumerate() {
+        if index > 0 {
+            output.push(' ');
+        }
+        let (core, suffix) = split_trailing_suffix(part);
+        if core.is_empty() {
+            output.push_str(suffix);
+            continue;
+        }
+        output.push_str(&reinterpret_word(core, source, target)?);
+        output.push_str(suffix);
+    }
+    Ok(output)
+}
+
+/// Split trailing sentence punctuation off a token.
+///
+/// The engine uses this before conversion so `ghbdtn,` keeps its comma.
+#[must_use]
+pub fn split_trailing_suffix(word: &str) -> (&str, &str) {
+    let mut split = word.len();
+    for (index, ch) in word.char_indices().rev() {
+        if is_sentence_suffix(ch) {
+            split = index;
+        } else {
+            break;
+        }
+    }
+    word.split_at(split)
+}
+
+fn is_sentence_suffix(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ',' | ';' | ':' | ')' | ']' | '}' | '"' | '\'' | '!' | '?'
+    )
+}
+
 /// The result of converting the last word in a text fragment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LastWordConversion {

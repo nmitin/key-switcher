@@ -38,7 +38,7 @@ pub struct CorrectionPlan {
 }
 
 fn is_control_separator(ch: char) -> bool {
-    matches!(ch, '\n' | '\t')
+    matches!(ch, '\n' | '\t' | ' ')
 }
 
 impl CorrectionPlan {
@@ -101,7 +101,16 @@ impl<D: Detector> CorrectionManager<D> {
     /// Manually convert the current word (FR-03).
     pub fn on_fix_last_word(&mut self, context: &InputContext<'_>) -> Option<CorrectionPlan> {
         let correction = self.engine.fix_last_word(context)?;
-        let source = context.active_layout;
+        Some(self.manual_plan(correction, context.active_layout))
+    }
+
+    /// Manually convert the current phrase (double/triple Shift gestures).
+    pub fn on_fix_last_phrase(&mut self, context: &InputContext<'_>) -> Option<CorrectionPlan> {
+        let correction = self.engine.fix_last_phrase(context)?;
+        Some(self.manual_plan(correction, context.active_layout))
+    }
+
+    fn manual_plan(&mut self, correction: Correction, source: LayoutId) -> CorrectionPlan {
         let target = source.other();
         let plan = CorrectionPlan {
             kind: PlanKind::Replace,
@@ -115,7 +124,7 @@ impl<D: Detector> CorrectionManager<D> {
             target,
             correction,
         });
-        Some(plan)
+        plan
     }
 
     /// Undo or redo the last correction.
@@ -303,6 +312,34 @@ mod tests {
         assert_eq!(plan.backspaces, 6);
         assert_eq!(plan.text, "привет");
         assert_eq!(plan.separator, None);
+    }
+
+    #[test]
+    fn manual_word_fix_after_space_keeps_the_trailing_space() {
+        let mut manager = manager();
+        let context = context(Profile::Manual, LayoutId::Us);
+        type_text(&mut manager, "ghbdtn ", &context);
+        let plan = manager.on_fix_last_word(&context).expect("plan");
+        assert_eq!(plan.kind, PlanKind::Replace);
+        assert_eq!(plan.layout, LayoutId::Ru);
+        assert_eq!(plan.backspaces, 6);
+        assert_eq!(plan.text, "привет");
+        assert_eq!(plan.separator, None);
+        assert!(plan.is_typeable());
+    }
+
+    #[test]
+    fn manual_phrase_plan_types_spaces_inside_the_phrase() {
+        let mut manager = manager();
+        let context = context(Profile::Manual, LayoutId::Us);
+        type_text(&mut manager, "ghbdtn vbh ", &context);
+        let plan = manager.on_fix_last_phrase(&context).expect("plan");
+        assert_eq!(plan.kind, PlanKind::Replace);
+        assert_eq!(plan.layout, LayoutId::Ru);
+        assert_eq!(plan.backspaces, 10);
+        assert_eq!(plan.text, "привет мир");
+        assert_eq!(plan.separator, None);
+        assert!(plan.is_typeable());
     }
 
     #[test]

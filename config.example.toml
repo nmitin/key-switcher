@@ -13,7 +13,8 @@ pause_hotkey = "Ctrl+F9"
 sound_on_layout_change = true       # звук при смене раскладки
 sound_file = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
 backspace_undo = true
-double_shift_fix = true             # двойной Shift — исправить последнее слово
+double_shift_fix = true             # двойной Shift — последнее слово
+triple_shift_phrase = true          # тройной Shift — вся фраза
 
 [capture]
 backend = "auto"                   # auto | evdev | xrecord | portal | ime

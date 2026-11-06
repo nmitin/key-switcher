@@ -14,6 +14,8 @@ pub const BACKSPACE_KEYCODE: u8 = 22;
 pub const RETURN_KEYCODE: u8 = 36;
 /// Standard evdev keycode for Tab.
 pub const TAB_KEYCODE: u8 = 23;
+/// Standard evdev keycode for Space.
+pub const SPACE_KEYCODE: u8 = 65;
 /// Standard evdev keycode for Shift.
 pub const SHIFT_KEYCODE: u8 = 50;
 /// Standard evdev keycode for left Control.
@@ -77,6 +79,10 @@ impl X11Injector {
             }
             if ch == '\t' {
                 keycodes.push((TAB_KEYCODE, false));
+                continue;
+            }
+            if ch == ' ' {
+                keycodes.push((SPACE_KEYCODE, false));
                 continue;
             }
             let keystroke = layout
