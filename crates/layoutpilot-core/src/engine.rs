@@ -239,6 +239,8 @@ pub struct Engine<D: Detector> {
     current_word: String,
     word_tainted: bool,
     next_word_attached: bool,
+    /// The early trigger already fired for the current word.
+    early_fired: bool,
     paused: bool,
     undo: Option<UndoRecord>,
     last_reset: Option<ResetReason>,
@@ -255,6 +257,7 @@ impl<D: Detector> Engine<D> {
             current_word: String::new(),
             word_tainted: false,
             next_word_attached: false,
+            early_fired: false,
             paused: false,
             undo: None,
             last_reset: None,
@@ -352,10 +355,11 @@ impl<D: Detector> Engine<D> {
             if self.current_word.is_empty() {
                 self.word_tainted = self.next_word_attached;
                 self.next_word_attached = false;
+                self.early_fired = false;
             }
             self.current_word.push(ch);
             self.buffer.push(ch);
-            return None;
+            return self.evaluate_early(context);
         }
 
         // Punctuation is kept inside the word when it can be a letter in the
@@ -658,6 +662,67 @@ impl<D: Detector> Engine<D> {
     /// first word that does not qualify, at a line break or at sentence
     /// punctuation. Words that were corrected earlier are already in the
     /// target script and cannot be reinterpreted, so they stop it too.
+    /// Correct the unfinished word if its prefix cannot start a word of the
+    /// current language but commonly starts one in the other. The rest of the
+    /// word is then typed directly in the right layout. If the guess was
+    /// wrong, the regular check at the separator converts the finished word
+    /// back (`iner` → `штук`, … `штукешф ` → `inertia `).
+    fn evaluate_early(&mut self, context: &InputContext<'_>) -> Option<Action> {
+        if !self.config.early_trigger
+            || self.early_fired
+            || self.word_tainted
+            || !matches!(context.profile, Profile::Auto | Profile::Aggressive)
+            || !context.layout_trusted
+            || context.ime_active
+        {
+            return None;
+        }
+        let target = context.active_layout.other();
+        let candidate = reinterpret_word(
+            &self.current_word,
+            context.active_layout.table(),
+            target.table(),
+        )
+        .ok()?;
+        let letters = candidate.chars().filter(|ch| ch.is_alphabetic()).count();
+        if letters < self.config.early_min_len.max(1)
+            || candidate == self.current_word
+            || !candidate.chars().all(is_word_char)
+            || !target.table().can_type(&candidate)
+        {
+            return None;
+        }
+        let text = self.buffer.text();
+        if is_protected_context(&text) {
+            return None;
+        }
+        let confidence = self
+            .detector
+            .early_confidence(&self.current_word, &candidate)
+            .clamp(0.0, 1.0);
+        if confidence < self.config.threshold_for(context.profile) {
+            return None;
+        }
+
+        let head = text
+            .strip_suffix(self.current_word.as_str())
+            .unwrap_or_default();
+        let (mut original, mut replacement) = self.lookback(head, context);
+        original.push_str(&self.current_word);
+        replacement.push_str(&candidate);
+        if !self.buffer.replace_suffix(&original, &replacement) {
+            return None;
+        }
+        self.early_fired = true;
+        self.current_word = candidate;
+        let correction = Correction::new(original, replacement, None);
+        self.undo = self.config.undo_enabled.then(|| UndoRecord {
+            correction: correction.clone(),
+            applied: true,
+        });
+        Some(Action::Replace(correction))
+    }
+
     fn lookback(&self, head: &str, context: &InputContext<'_>) -> (String, String) {
         let mut original = String::new();
         let mut converted = String::new();
@@ -870,6 +935,53 @@ mod tests {
         let correction = replace(type_text(&mut engine, "yt ghbitk ", &auto()));
         assert_eq!(correction.original, "yt ghbitk");
         assert_eq!(engine.buffer_text(), "пришел не пришел ");
+    }
+
+    fn early_config() -> EngineConfig {
+        EngineConfig {
+            early_trigger: true,
+            ..EngineConfig::default()
+        }
+    }
+
+    #[test]
+    fn early_trigger_fires_mid_word() {
+        let mut engine = Engine::new(early_config(), detector());
+        assert_eq!(type_text(&mut engine, "ghb", &auto()), None);
+        let correction = replace(engine.on_char('d', &auto()));
+        assert_eq!(correction.original, "ghbd");
+        assert_eq!(correction.converted, "прив");
+        assert_eq!(correction.separator, None);
+        assert_eq!(correction.delete_chars(true), 4);
+
+        // The daemon switched to `ru`; the rest arrives in Cyrillic and the
+        // finished word is not corrected again.
+        let ru = InputContext::new(Profile::Auto, LayoutId::Ru);
+        assert_eq!(type_text(&mut engine, "ет ", &ru), None);
+        assert_eq!(engine.buffer_text(), "привет ");
+    }
+
+    #[test]
+    fn early_trigger_is_opt_in_and_profile_bound() {
+        let mut engine = Engine::new(EngineConfig::default(), detector());
+        assert_eq!(type_text(&mut engine, "ghbd", &auto()), None);
+
+        for profile in [Profile::Manual, Profile::Conservative] {
+            let mut engine = Engine::new(early_config(), detector());
+            let context = InputContext::new(profile, LayoutId::Us);
+            assert_eq!(
+                type_text(&mut engine, "ghbd", &context),
+                None,
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn early_trigger_skips_known_prefixes() {
+        // `hel` starts `hello`: still possible in English.
+        let mut engine = Engine::new(early_config(), detector());
+        assert_eq!(type_text(&mut engine, "hell", &auto()), None);
     }
 
     #[test]

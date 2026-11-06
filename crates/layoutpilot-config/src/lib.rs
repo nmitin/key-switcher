@@ -235,6 +235,8 @@ pub struct GeneralConfig {
     pub lookback_words: usize,
     /// Show a system tray icon (pause/resume, correction indicator).
     pub tray: bool,
+    /// Correct before the word is finished (no space needed).
+    pub early_trigger: bool,
 }
 
 impl Default for GeneralConfig {
@@ -255,6 +257,7 @@ impl Default for GeneralConfig {
             triple_shift_phrase: true,
             lookback_words: 4,
             tray: true,
+            early_trigger: false,
         }
     }
 }
@@ -593,6 +596,7 @@ impl Config {
             punct_trigger: self.general.triggers.contains(&Trigger::Punct),
             enter_trigger: self.general.triggers.contains(&Trigger::Enter),
             lookback_words: self.general.lookback_words,
+            early_trigger: self.general.early_trigger,
             ..EngineConfig::default()
         }
     }

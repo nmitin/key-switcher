@@ -24,6 +24,15 @@ pub struct DetectionContext<'a> {
 pub trait Detector: Send + Sync {
     /// Calibrated confidence that the candidate should replace the typed word.
     fn confidence(&self, context: &DetectionContext<'_>) -> f32;
+
+    /// Confidence that an unfinished word was typed in the wrong layout.
+    ///
+    /// `typed` is the prefix as typed, `candidate` the same keys in the other
+    /// layout. Used by the early trigger, which corrects before the word is
+    /// complete. The default never fires.
+    fn early_confidence(&self, _typed: &str, _candidate: &str) -> f32 {
+        0.0
+    }
 }
 
 /// A detector with a fixed confidence, useful in tests and as a default.
@@ -105,6 +114,17 @@ impl Detector for LexiconDetector {
             (true, false) => 0.001,
             // Both known or both unknown: do not guess.
             _ => 0.5,
+        }
+    }
+
+    /// Fires when no known word starts with `typed` but one starts with
+    /// `candidate`.
+    fn early_confidence(&self, typed: &str, candidate: &str) -> f32 {
+        let starts = |prefix: &str| self.words.iter().any(|word| word.starts_with(prefix));
+        if !starts(typed) && starts(candidate) {
+            0.999
+        } else {
+            0.0
         }
     }
 }

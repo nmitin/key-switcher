@@ -193,3 +193,57 @@ fn real_words_stop_the_lookback() {
         );
     }
 }
+
+/// Type physical keys (given as `us` characters) like the daemon does: an
+/// early correction switches the layout, and later keys produce characters of
+/// the new layout. Returns the resulting text.
+fn type_with_early_trigger(keys: &str) -> String {
+    let config = EngineConfig {
+        early_trigger: true,
+        ..EngineConfig::default()
+    };
+    let mut engine = Engine::new(config, DictionaryDetector::new());
+    let mut layout = LayoutId::Us;
+    for key in keys.chars() {
+        let ch = if layout == LayoutId::Us || key == ' ' {
+            key
+        } else {
+            let stroke = LayoutId::Us.table().keystroke_for(key).expect("us key");
+            LayoutId::Ru.table().char_at(stroke).expect("ru char")
+        };
+        let context = InputContext::new(Profile::Auto, layout);
+        if let Some(Action::Replace(_)) = engine.on_char(ch, &context) {
+            layout = layout.other();
+        }
+    }
+    engine.buffer_text()
+}
+
+#[test]
+fn early_trigger_switches_layout_mid_word() {
+    assert_eq!(type_with_early_trigger("ghbdtn "), "привет ");
+    assert_eq!(
+        type_with_early_trigger("f jy yt ghbitk "),
+        "а он не пришел "
+    );
+}
+
+#[test]
+fn early_trigger_leaves_real_and_technical_words_alone() {
+    for word in [
+        "hello", "kubectl", "systemd", "yakuake", "github", "nginx", "postgres", "inertia",
+        "wayland",
+    ] {
+        let text = format!("{word} ");
+        assert_eq!(type_with_early_trigger(&text), text, "{word}");
+    }
+}
+
+#[test]
+fn early_trigger_detector_needs_an_impossible_prefix() {
+    let detector = DictionaryDetector::new();
+    assert!(detector.early_confidence_for("ghbd", "прив") > 0.9);
+    assert!(detector.early_confidence_for("hell", "рудд") < 0.1);
+    assert!(detector.early_confidence_for("руддщ", "hello") > 0.9);
+    assert!(detector.early_confidence_for("прив", "ghbd") < 0.1);
+}

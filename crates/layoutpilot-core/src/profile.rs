@@ -64,6 +64,11 @@ pub struct EngineConfig {
     /// confidently corrected word. Lower than the main threshold: the
     /// corrected word already proves the layout was wrong.
     pub lookback_threshold: f32,
+    /// Correct a word before it is finished, as soon as its prefix is
+    /// impossible in the current language and common in the other one.
+    pub early_trigger: bool,
+    /// Minimum letters before the early trigger may fire (default 4).
+    pub early_min_len: usize,
 }
 
 impl Default for EngineConfig {
@@ -83,6 +88,8 @@ impl Default for EngineConfig {
             undo_enabled: true,
             lookback_words: 4,
             lookback_threshold: 0.7,
+            early_trigger: false,
+            early_min_len: 4,
         }
     }
 }

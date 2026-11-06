@@ -19,7 +19,8 @@
 
 use std::collections::HashMap;
 
-use fst::Map;
+use fst::automaton::Str;
+use fst::{Automaton, IntoStreamer, Map, Streamer};
 use layoutpilot_core::{DetectionContext, Detector};
 
 #[allow(missing_docs)]
@@ -28,6 +29,12 @@ mod data {
     pub const EN_FST: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/en.fst"));
     include!(concat!(env!("OUT_DIR"), "/ngrams.rs"));
 }
+
+/// Share of the target corpus that words starting with the candidate prefix
+/// must cover for the early trigger. Calibrated with
+/// `tools/calibrate_early.py`: 4 letters and `1e-5` give ~0.06% false
+/// triggers on out-of-dictionary words at ~96% recall.
+const EARLY_MIN_SHARE: f64 = 1e-5;
 
 const START: char = '\u{2}';
 const END: char = '\u{3}';
@@ -138,6 +145,27 @@ impl LanguageModel {
 
     fn count_lower(&self, word: &str) -> Option<u64> {
         self.dict.get(word.as_bytes()).filter(|count| *count > 0)
+    }
+
+    /// Whether any dictionary word starts with `prefix` (lowercase).
+    fn has_prefix(&self, prefix: &str) -> bool {
+        let matcher = Str::new(prefix).starts_with();
+        self.dict.search(matcher).into_stream().next().is_some()
+    }
+
+    /// Total frequency of words starting with `prefix` (lowercase), counting
+    /// only until `enough` is reached.
+    fn prefix_frequency(&self, prefix: &str, enough: u64) -> u64 {
+        let matcher = Str::new(prefix).starts_with();
+        let mut stream = self.dict.search(matcher).into_stream();
+        let mut total = 0_u64;
+        while let Some((_, count)) = stream.next() {
+            total = total.saturating_add(count);
+            if total >= enough {
+                break;
+            }
+        }
+        total
     }
 
     fn unknown_score(&self) -> f64 {
@@ -302,6 +330,35 @@ impl DictionaryDetector {
         }
     }
 
+    /// Early-trigger confidence for an unfinished word: no known word of the
+    /// typed language starts with `typed`, while words starting with
+    /// `candidate` are common in the other language.
+    #[must_use]
+    pub fn early_confidence_for(&self, typed: &str, candidate: &str) -> f32 {
+        let Some(target) = language_of(candidate) else {
+            return 0.0;
+        };
+        let source = match target {
+            Language::Ru => Language::En,
+            Language::En => Language::Ru,
+        };
+        let typed = typed.to_lowercase();
+        let candidate = candidate.to_lowercase();
+        if self.model(source).has_prefix(&typed)
+            || self.user.keys().any(|word| word.starts_with(&typed))
+        {
+            return 0.0;
+        }
+        let model = self.model(target);
+        let enough = (model.total_freq as f64 * EARLY_MIN_SHARE).ceil() as u64;
+        let user_known = self.user.keys().any(|word| word.starts_with(&candidate));
+        if user_known || model.prefix_frequency(&candidate, enough.max(1)) >= enough.max(1) {
+            0.999
+        } else {
+            0.0
+        }
+    }
+
     fn model(&self, language: Language) -> &LanguageModel {
         match language {
             Language::Ru => &self.ru,
@@ -319,6 +376,10 @@ impl Default for DictionaryDetector {
 impl Detector for DictionaryDetector {
     fn confidence(&self, context: &DetectionContext<'_>) -> f32 {
         self.confidence_for(context.typed, context.candidate)
+    }
+
+    fn early_confidence(&self, typed: &str, candidate: &str) -> f32 {
+        self.early_confidence_for(typed, candidate)
     }
 }
 
