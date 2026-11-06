@@ -8,6 +8,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use zbus::blocking::{Connection, Proxy};
 use zbus::interface;
@@ -24,8 +25,15 @@ workspace.windowActivated.connect(report);
 report();
 "#;
 
+#[derive(Debug, Default)]
+struct FocusState {
+    app: Option<String>,
+    /// When KWin last reported a window activation.
+    changed_at: Option<Instant>,
+}
+
 struct FocusBridge {
-    app: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<FocusState>>,
 }
 
 #[interface(name = "org.kde.LayoutPilot.Focus")]
@@ -36,8 +44,9 @@ impl FocusBridge {
         } else {
             Some(resource_class)
         };
-        if let Ok(mut app) = self.app.lock() {
-            *app = value;
+        if let Ok(mut state) = self.state.lock() {
+            state.app = value;
+            state.changed_at = Some(Instant::now());
         }
     }
 }
@@ -45,13 +54,13 @@ impl FocusBridge {
 /// KWin-backed active application lookup.
 pub(crate) struct KdeFocus {
     _connection: Connection,
-    app: Arc<Mutex<Option<String>>>,
+    state: Arc<Mutex<FocusState>>,
 }
 
 impl KdeFocus {
     /// Own the callback bus name and load the KWin script.
     pub(crate) fn start() -> Result<Self, String> {
-        let app = Arc::new(Mutex::new(None));
+        let state = Arc::new(Mutex::new(FocusState::default()));
         let connection = zbus::blocking::connection::Builder::session()
             .map_err(|error| format!("session bus: {error}"))?
             .name(BUS_NAME)
@@ -59,7 +68,7 @@ impl KdeFocus {
             .serve_at(
                 OBJECT_PATH,
                 FocusBridge {
-                    app: Arc::clone(&app),
+                    state: Arc::clone(&state),
                 },
             )
             .map_err(|error| format!("serve {OBJECT_PATH}: {error}"))?
@@ -85,13 +94,18 @@ impl KdeFocus {
 
         Ok(Self {
             _connection: connection,
-            app,
+            state,
         })
     }
 
     /// Last active application class reported by KWin.
     pub(crate) fn app_id(&self) -> Option<String> {
-        self.app.lock().ok().and_then(|app| app.clone())
+        self.state.lock().ok().and_then(|state| state.app.clone())
+    }
+
+    /// When KWin last activated a window (any window, even of the same app).
+    pub(crate) fn changed_at(&self) -> Option<Instant> {
+        self.state.lock().ok().and_then(|state| state.changed_at)
     }
 }
 

@@ -19,6 +19,7 @@ pub(crate) const FLASH: Duration = Duration::from_millis(1500);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TrayCommand {
     TogglePause,
+    ToggleTerminals,
     Quit,
 }
 
@@ -32,6 +33,8 @@ pub(crate) struct TrayState {
     /// `typed → converted` of the last correction, shown in the menu and tooltip.
     pub last: Option<String>,
     pub pause_hotkey: String,
+    /// Terminals (the `manual` profile) are corrected automatically.
+    pub terminals_auto: bool,
 }
 
 struct LayoutPilotTray {
@@ -137,6 +140,14 @@ impl ksni::Tray for LayoutPilotTray {
                 ..Default::default()
             }
             .into(),
+            CheckmarkItem {
+                label: "Автоисправление в терминалах".to_owned(),
+                checked: self.state.terminals_auto,
+                activate: Box::new(|tray: &mut Self| tray.send(TrayCommand::ToggleTerminals)),
+                ..Default::default()
+            }
+            .into(),
+            MenuItem::Separator,
             StandardItem {
                 label: "Выход".to_owned(),
                 icon_name: "application-exit".to_owned(),
@@ -186,6 +197,10 @@ impl TrayHandle {
 
     pub(crate) fn set_paused(&mut self, paused: bool) {
         self.update(|state| state.paused = paused);
+    }
+
+    pub(crate) fn set_terminals_auto(&mut self, enabled: bool) {
+        self.update(|state| state.terminals_auto = enabled);
     }
 
     /// Count a correction and highlight the icon for [`FLASH`].

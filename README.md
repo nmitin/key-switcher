@@ -35,7 +35,7 @@ X11-демон, evdev-capture, uinput-инъекция и конфиг; пров
   Ctrl/Alt/Super, активный IME, недостоверный layout state;
 - `Detector`-трейт для вероятности кандидата;
 - undo/redo с инвалидацией при любом новом вводе или сбросе контекста; Backspace
-  сразу после коррекции отменяет её (`backspace_undo`);
+  сразу после коррекции отменяет её (`backspace_undo`, по умолчанию выключено);
 - `Action::Replace/Undo/Redo` с числом Backspace и текстом для инжектора.
 
 `layoutpilot-daemon` — исполняемый вертикальный срез:

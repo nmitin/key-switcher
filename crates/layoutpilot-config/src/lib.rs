@@ -250,7 +250,7 @@ impl Default for GeneralConfig {
             pause_hotkey: "Ctrl+F9".to_owned(),
             sound_on_layout_change: true,
             sound_file: "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga".to_owned(),
-            backspace_undo: true,
+            backspace_undo: false,
             double_shift_fix: true,
             triple_shift_phrase: true,
             lookback_words: 4,
@@ -641,7 +641,7 @@ mod tests {
         assert!(config.inject.request_permission_on_start);
         assert!(config.general.sound_on_layout_change);
         assert!(config.general.sound_file.contains("camera-shutter"));
-        assert!(config.general.backspace_undo);
+        assert!(!config.general.backspace_undo);
         assert!(config.general.double_shift_fix);
         assert!(config.general.triple_shift_phrase);
         assert_eq!(config.layout.backend, LayoutBackend::Auto);

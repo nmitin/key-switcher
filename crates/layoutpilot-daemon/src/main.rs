@@ -52,6 +52,9 @@ const MODIFIER_RELEASE_WAIT: Duration = Duration::from_millis(300);
 const CAPTURE_LAG: Duration = Duration::from_millis(10);
 /// Repair passes for keys typed during injection before giving up.
 const MAX_REPAIRS: usize = 3;
+/// A layout change this soon after a window activation comes from per-window
+/// layouts, not from the user: no sound.
+const FOCUS_LAYOUT_WINDOW: Duration = Duration::from_millis(700);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum HotkeyAction {
@@ -521,6 +524,9 @@ struct Daemon {
     shift_gesture: ShiftGesture,
     last_word_fix_at: Option<Instant>,
     tray: Option<TrayHandle>,
+    /// Runtime override from the tray: `manual` apps (terminals) become `auto`.
+    terminals_auto: bool,
+    focus_changed_at: Option<Instant>,
     dry_run: bool,
 }
 
@@ -595,6 +601,8 @@ impl Daemon {
             shift_gesture: ShiftGesture::default(),
             last_word_fix_at: None,
             tray: None,
+            terminals_auto: false,
+            focus_changed_at: None,
             dry_run,
         };
         if daemon.config.general.tray {
@@ -962,6 +970,18 @@ impl Daemon {
                 self.toggle_pause();
                 true
             }
+            TrayCommand::ToggleTerminals => {
+                self.terminals_auto = !self.terminals_auto;
+                self.profile = self.effective_profile();
+                println!(
+                    "layoutpilot: terminals auto={}, profile={:?}",
+                    self.terminals_auto, self.profile
+                );
+                if let Some(tray) = self.tray.as_mut() {
+                    tray.set_terminals_auto(self.terminals_auto);
+                }
+                true
+            }
             TrayCommand::Quit => false,
         }
     }
@@ -1261,7 +1281,7 @@ impl Daemon {
     fn refresh_layout(&mut self) {
         let active = self.layouts.active_layout().ok().flatten();
         if active != self.active_layout {
-            if self.active_layout.is_some() && active.is_some() {
+            if self.active_layout.is_some() && active.is_some() && !self.layout_follows_focus() {
                 self.sound.play();
             }
             self.active_layout = active;
@@ -1270,6 +1290,28 @@ impl Daemon {
             }
             println!("layoutpilot: active layout → {active:?}");
             self.manager.reset(ResetReason::LayoutChange);
+        }
+    }
+
+    /// Whether the layout change was caused by a window switch (KDE and other
+    /// desktops keep a layout per window) rather than by the user.
+    fn layout_follows_focus(&mut self) -> bool {
+        self.refresh_focus(true);
+        let recent = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < FOCUS_LAYOUT_WINDOW);
+        recent(self.focus_changed_at)
+            || recent(
+                self.kde_focus
+                    .as_ref()
+                    .and_then(kde_focus::KdeFocus::changed_at),
+            )
+    }
+
+    fn effective_profile(&self) -> Profile {
+        let profile = self.resolver.resolve(self.app_id.as_deref().unwrap_or(""));
+        if self.terminals_auto && profile == Profile::Manual {
+            Profile::Auto
+        } else {
+            profile
         }
     }
 
@@ -1295,8 +1337,9 @@ impl Daemon {
         let app_changed = self.app_id != app_id;
         self.window = window;
         self.app_id = app_id;
-        self.profile = self.resolver.resolve(self.app_id.as_deref().unwrap_or(""));
+        self.profile = self.effective_profile();
         if window_changed || app_changed {
+            self.focus_changed_at = Some(Instant::now());
             println!(
                 "layoutpilot: focus window={:?}, app={:?}, profile={:?}",
                 self.window, self.app_id, self.profile
