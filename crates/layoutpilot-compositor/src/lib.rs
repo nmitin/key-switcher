@@ -13,6 +13,10 @@ mod hyprland;
 mod sway;
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use layoutpilot_core::LayoutId;
 use zbus::blocking::{Connection, Proxy};
@@ -23,6 +27,10 @@ pub use sway::{SwayError, SwayLayouts};
 const KDE_SERVICE: &str = "org.kde.keyboard";
 const KDE_PATH: &str = "/Layouts";
 const KDE_INTERFACE: &str = "org.kde.KeyboardLayouts";
+/// With a live signal subscription, `getLayout` is only a periodic sanity
+/// check against a missed signal.
+const KDE_RESYNC: Duration = Duration::from_secs(2);
+const UNKNOWN_INDEX: u32 = u32::MAX;
 
 /// Map an XKB layout description to a supported [`LayoutId`].
 ///
@@ -109,6 +117,11 @@ impl From<zbus::Error> for KdeError {
 pub struct KdeLayouts {
     connection: Connection,
     layouts: Vec<KdeLayout>,
+    /// Index from the last `layoutChanged` signal or query.
+    cached: Arc<AtomicU32>,
+    /// The signal thread is running.
+    watching: Arc<AtomicBool>,
+    last_sync: Mutex<Option<Instant>>,
 }
 
 impl KdeLayouts {
@@ -118,9 +131,58 @@ impl KdeLayouts {
         let mut provider = Self {
             connection,
             layouts: Vec::new(),
+            cached: Arc::new(AtomicU32::new(UNKNOWN_INDEX)),
+            watching: Arc::new(AtomicBool::new(false)),
+            last_sync: Mutex::new(None),
         };
         provider.layouts = provider.read_layouts()?;
         Ok(provider)
+    }
+
+    /// Follow `layoutChanged` signals in a background thread, so that
+    /// [`Self::current`] does not need a D-Bus round trip per call.
+    pub fn watch(&self) -> Result<(), KdeError> {
+        let connection = Connection::session()?;
+        let cached = Arc::clone(&self.cached);
+        let watching = Arc::clone(&self.watching);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        thread::Builder::new()
+            .name("kde-layout-signals".to_owned())
+            .spawn(move || {
+                let signals = Proxy::new(&connection, KDE_SERVICE, KDE_PATH, KDE_INTERFACE)
+                    .and_then(|proxy| proxy.receive_signal("layoutChanged"));
+                let signals = match signals {
+                    Ok(signals) => {
+                        let _ = ready_tx.send(Ok(()));
+                        signals
+                    }
+                    Err(error) => {
+                        let _ = ready_tx.send(Err(error));
+                        return;
+                    }
+                };
+                watching.store(true, Ordering::Release);
+                for message in signals {
+                    if let Ok(index) = message.body().deserialize::<u32>() {
+                        cached.store(index, Ordering::Release);
+                    }
+                }
+                watching.store(false, Ordering::Release);
+            })
+            .map_err(|error| KdeError::Zbus(zbus::Error::InputOutput(Arc::new(error))))?;
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => Err(error.into()),
+            Err(_) => Err(KdeError::Zbus(zbus::Error::Failure(
+                "layout signal thread exited".to_owned(),
+            ))),
+        }
+    }
+
+    /// Whether the signal subscription is alive.
+    #[must_use]
+    pub fn is_watching(&self) -> bool {
+        self.watching.load(Ordering::Acquire)
     }
 
     /// Cached layout entries.
@@ -129,9 +191,26 @@ impl KdeLayouts {
         &self.layouts
     }
 
-    /// Current KDE layout.
+    /// Current KDE layout: from the signal cache while subscribed, with a
+    /// D-Bus query at most every [`KDE_RESYNC`].
     pub fn current(&self) -> Result<Option<LayoutId>, KdeError> {
-        let index = self.current_index()?;
+        let cached = self.cached.load(Ordering::Acquire);
+        let fresh = self
+            .last_sync
+            .lock()
+            .ok()
+            .and_then(|last| *last)
+            .is_some_and(|at| at.elapsed() < KDE_RESYNC);
+        let index = if self.is_watching() && fresh && cached != UNKNOWN_INDEX {
+            cached
+        } else {
+            let index = self.current_index()?;
+            self.cached.store(index, Ordering::Release);
+            if let Ok(mut last) = self.last_sync.lock() {
+                *last = Some(Instant::now());
+            }
+            index
+        };
         self.layouts
             .get(usize::try_from(index).unwrap_or(usize::MAX))
             .map_or(Ok(None), |layout| Ok(layout.id))
@@ -159,6 +238,8 @@ impl KdeLayouts {
         let proxy = self.proxy()?;
         let accepted: bool = proxy.call("setLayout", &(entry.index,))?;
         if accepted {
+            // Do not wait for our own signal to see the new layout.
+            self.cached.store(entry.index, Ordering::Release);
             Ok(())
         } else {
             Err(KdeError::Rejected(layout))

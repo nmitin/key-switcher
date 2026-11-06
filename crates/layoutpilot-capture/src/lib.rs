@@ -10,13 +10,14 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::Arc;
-use std::thread::{self, JoinHandle};
+use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::Duration;
 
 use evdev::{Device, EventType, KeyCode};
@@ -211,13 +212,38 @@ pub fn probe_keyboards() -> Result<Vec<KeyboardInfo>, EvdevError> {
     Ok(keyboards)
 }
 
-/// Non-blocking capture from all readable keyboards.
+/// How often `/dev/input` is rescanned for keyboards plugged in later.
+const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// A keyboard appeared or disappeared after capture started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceChange {
+    /// A new keyboard is being read.
+    Added(KeyboardInfo),
+    /// A keyboard stopped delivering events (unplugged or failed).
+    Removed(KeyboardInfo),
+}
+
+/// State shared by the reader threads and the hotplug scanner.
+#[derive(Debug, Default)]
+struct Shared {
+    stop: AtomicBool,
+    /// Paths with a live reader thread.
+    open: Mutex<HashSet<PathBuf>>,
+}
+
+/// Capture from all readable keyboards, including ones plugged in later.
+///
+/// Every keyboard gets a reader thread doing blocking reads; a scanner thread
+/// rescans `/dev/input` every [`RESCAN_INTERVAL`]. Kernel `SYN_DROPPED`
+/// overflows are resynchronised by [`evdev::Device::fetch_events`], which
+/// synthesises the missed key state changes.
 #[derive(Debug)]
 pub struct EvdevCapture {
     devices: Vec<KeyboardInfo>,
     receiver: Receiver<EvdevKeyEvent>,
-    stop: Arc<AtomicBool>,
-    threads: Vec<JoinHandle<()>>,
+    changes: Receiver<DeviceChange>,
+    shared: Arc<Shared>,
 }
 
 impl EvdevCapture {
@@ -225,7 +251,8 @@ impl EvdevCapture {
     pub fn open() -> Result<Self, EvdevError> {
         let devices = probe_keyboards()?;
         let (sender, receiver) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
+        let (change_sender, changes) = mpsc::channel();
+        let shared = Arc::new(Shared::default());
         // Open everything first: if one device fails, no reader thread is left
         // behind with no owner to stop it.
         let mut opened = Vec::with_capacity(devices.len());
@@ -234,41 +261,35 @@ impl EvdevCapture {
                 path: info.path.clone(),
                 error,
             })?;
-            device
-                .set_nonblocking(true)
-                .map_err(|error| EvdevError::Device {
-                    path: info.path.clone(),
-                    error,
-                })?;
             opened.push((info.clone(), device));
         }
-
-        let mut threads = Vec::with_capacity(opened.len());
-        for (info, mut device) in opened {
-            let name = info
-                .name
-                .clone()
-                .unwrap_or_else(|| info.path.display().to_string());
-            let sender = sender.clone();
-            let stop = Arc::clone(&stop);
-            threads.push(thread::spawn(move || {
-                read_device(&mut device, &name, &sender, &stop);
-            }));
+        for (info, device) in opened {
+            spawn_reader(info, device, &sender, &change_sender, &shared);
         }
-        drop(sender);
+
+        let scanner_shared = Arc::clone(&shared);
+        thread::Builder::new()
+            .name("evdev-hotplug".to_owned())
+            .spawn(move || scan_hotplug(&sender, &change_sender, &scanner_shared))?;
 
         Ok(Self {
             devices,
             receiver,
-            stop,
-            threads,
+            changes,
+            shared,
         })
     }
 
-    /// Devices used by this capture.
+    /// Devices opened at startup.
     #[must_use]
     pub fn devices(&self) -> &[KeyboardInfo] {
         &self.devices
+    }
+
+    /// Keyboards added or removed since the last call. Never blocks.
+    #[must_use]
+    pub fn take_device_changes(&self) -> Vec<DeviceChange> {
+        self.changes.try_iter().collect()
     }
 
     /// Wait for the next key event.
@@ -285,12 +306,10 @@ impl EvdevCapture {
         }
     }
 
-    /// Stop all reader threads.
+    /// Stop capturing. Reader threads block in `read(2)`; they notice the
+    /// flag on their next event and exit with the process otherwise.
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
-        for thread in self.threads.drain(..) {
-            let _ = thread.join();
-        }
+        self.shared.stop.store(true, Ordering::Relaxed);
     }
 }
 
@@ -300,6 +319,106 @@ impl Drop for EvdevCapture {
     }
 }
 
+fn spawn_reader(
+    info: KeyboardInfo,
+    mut device: Device,
+    sender: &Sender<EvdevKeyEvent>,
+    changes: &Sender<DeviceChange>,
+    shared: &Arc<Shared>,
+) {
+    if let Ok(mut open) = shared.open.lock() {
+        open.insert(info.path.clone());
+    }
+    let path = info.path.clone();
+    let sender = sender.clone();
+    let changes = changes.clone();
+    let thread_shared = Arc::clone(shared);
+    let spawned = thread::Builder::new()
+        .name("evdev-reader".to_owned())
+        .spawn(move || {
+            let name = info
+                .name
+                .clone()
+                .unwrap_or_else(|| info.path.display().to_string());
+            read_device(&mut device, &name, &sender, &thread_shared.stop);
+            if let Ok(mut open) = thread_shared.open.lock() {
+                open.remove(&info.path);
+            }
+            if !thread_shared.stop.load(Ordering::Relaxed) {
+                let _ = changes.send(DeviceChange::Removed(info));
+            }
+        });
+    if spawned.is_err() {
+        if let Ok(mut open) = shared.open.lock() {
+            open.remove(&path);
+        }
+    }
+}
+
+/// Periodically open keyboards that are not read yet.
+fn scan_hotplug(
+    sender: &Sender<EvdevKeyEvent>,
+    changes: &Sender<DeviceChange>,
+    shared: &Arc<Shared>,
+) {
+    // Non-keyboards (mice, power buttons…) are probed once per node.
+    let mut ignored: HashSet<PathBuf> = HashSet::new();
+    loop {
+        thread::sleep(RESCAN_INTERVAL);
+        if shared.stop.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(paths) = event_nodes() else {
+            continue;
+        };
+        ignored.retain(|path| paths.contains(path));
+        let open = shared
+            .open
+            .lock()
+            .map(|open| open.clone())
+            .unwrap_or_default();
+        for path in paths {
+            if open.contains(&path) || ignored.contains(&path) {
+                continue;
+            }
+            let Ok(device) = Device::open(&path) else {
+                ignored.insert(path);
+                continue;
+            };
+            if device.name() == Some(layoutpilot_core::VIRTUAL_KEYBOARD_NAME)
+                || !is_keyboard(&device)
+            {
+                ignored.insert(path);
+                continue;
+            }
+            let info = KeyboardInfo {
+                path,
+                name: device.name().map(str::to_owned),
+                physical_path: device.physical_path().map(str::to_owned),
+            };
+            spawn_reader(info.clone(), device, sender, changes, shared);
+            if changes.send(DeviceChange::Added(info)).is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// `/dev/input/event*` nodes.
+fn event_nodes() -> io::Result<HashSet<PathBuf>> {
+    Ok(fs::read_dir(INPUT_DIR)?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("event"))
+        })
+        .collect())
+}
+
+/// Blocking read loop; returns when the device fails (e.g. is unplugged), the
+/// receiver is gone or capture is stopped.
 fn read_device(device: &mut Device, name: &str, sender: &Sender<EvdevKeyEvent>, stop: &AtomicBool) {
     while !stop.load(Ordering::Relaxed) {
         match device.fetch_events() {
@@ -318,9 +437,7 @@ fn read_device(device: &mut Device, name: &str, sender: &Sender<EvdevKeyEvent>, 
                     }
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                thread::sleep(Duration::from_millis(5));
-            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return,
         }
     }

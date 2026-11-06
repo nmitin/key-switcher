@@ -9,6 +9,7 @@
 
 mod kde_focus;
 mod learned;
+mod screen_lock;
 mod tail;
 mod tray;
 
@@ -20,7 +21,7 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, ExitCode, Stdio};
 use std::time::{Duration, Instant};
 
-use layoutpilot_capture::{EvdevCapture, EvdevKeyEvent};
+use layoutpilot_capture::{DeviceChange, EvdevCapture, EvdevKeyEvent};
 use layoutpilot_compositor::{HyprlandLayouts, KdeLayouts, SwayLayouts};
 use layoutpilot_config::{
     CaptureBackend, Config, DeleteMode, Hotkey, InjectBackend, LayoutBackend, Trigger,
@@ -35,6 +36,7 @@ use layoutpilot_x11::{
     char_for, modifiers, KeyEvent, X11Focus, X11HotkeyGrabber, X11Injector, X11LayoutState,
     XRecordCapture,
 };
+use screen_lock::ScreenLock;
 use tail::{tail_text, Blocked, PendingKey};
 use tray::{TrayCommand, TrayHandle, TrayState};
 
@@ -412,6 +414,11 @@ impl EvdevModifiers {
         false
     }
 
+    /// Forget held keys, e.g. when their keyboard was unplugged mid-press.
+    fn release_all(&mut self) {
+        self.pressed.clear();
+    }
+
     fn any_held(&self) -> bool {
         !self.pressed.is_empty()
     }
@@ -476,6 +483,13 @@ impl Capture {
         }
     }
 
+    fn take_device_changes(&self) -> Vec<DeviceChange> {
+        match self {
+            Self::X11(_) => Vec::new(),
+            Self::Evdev(capture) => capture.take_device_changes(),
+        }
+    }
+
     fn try_recv(&mut self) -> Result<Option<CapturedEvent>, Box<dyn Error>> {
         self.recv_timeout(Duration::ZERO)
     }
@@ -530,6 +544,9 @@ struct Daemon {
     focus_changed_at: Option<Instant>,
     /// Learning journal, when `privacy.learning` is on.
     learned_path: Option<PathBuf>,
+    screen_lock: Option<ScreenLock>,
+    /// Screen is locked: input is not processed at all.
+    locked: bool,
     dry_run: bool,
 }
 
@@ -607,8 +624,14 @@ impl Daemon {
             terminals_auto: false,
             focus_changed_at: None,
             learned_path: None,
+            screen_lock: None,
+            locked: false,
             dry_run,
         };
+        match ScreenLock::start() {
+            Ok(lock) => daemon.screen_lock = Some(lock),
+            Err(error) => eprintln!("layoutpilot: screen lock state unavailable: {error}"),
+        }
         if daemon.config.privacy.learning {
             daemon.load_learning();
         }
@@ -648,6 +671,8 @@ impl Daemon {
             }
 
             self.persist_learning();
+            self.poll_devices();
+            self.poll_screen_lock();
             if let Some(key) = self.backlog.pop_front() {
                 self.dispatch(key)?;
                 continue;
@@ -681,9 +706,43 @@ impl Daemon {
     }
 
     fn handle_captured(&mut self, event: CapturedEvent) -> Result<(), Box<dyn Error>> {
+        // Normalize even while locked so modifier state stays accurate.
         match self.normalize(event) {
-            Some(key) => self.dispatch(key),
-            None => Ok(()),
+            Some(key) if !self.locked => self.dispatch(key),
+            _ => Ok(()),
+        }
+    }
+
+    fn poll_devices(&mut self) {
+        for change in self.capture.take_device_changes() {
+            match change {
+                DeviceChange::Added(info) => {
+                    println!("layoutpilot: keyboard added: {}", device_label(&info));
+                }
+                DeviceChange::Removed(info) => {
+                    println!("layoutpilot: keyboard removed: {}", device_label(&info));
+                    self.evdev_modifiers.release_all();
+                }
+            }
+            self.manager.reset(ResetReason::DeviceChange);
+        }
+    }
+
+    fn poll_screen_lock(&mut self) {
+        let locked = self.screen_lock.as_ref().is_some_and(ScreenLock::is_locked);
+        if locked == self.locked {
+            return;
+        }
+        self.locked = locked;
+        if locked {
+            self.manager.reset(ResetReason::ScreenLock);
+            self.backlog.clear();
+            self.pending_space = false;
+            self.pending_enter = false;
+            self.shift_gesture.reset();
+            println!("layoutpilot: screen locked, input ignored");
+        } else {
+            println!("layoutpilot: screen unlocked");
         }
     }
 
@@ -1397,6 +1456,13 @@ impl Daemon {
     }
 }
 
+fn device_label(info: &layoutpilot_capture::KeyboardInfo) -> String {
+    match &info.name {
+        Some(name) => format!("{name} ({})", info.path.display()),
+        None => info.path.display().to_string(),
+    }
+}
+
 fn is_wayland_session() -> bool {
     env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland"))
         || env::var_os("WAYLAND_DISPLAY").is_some()
@@ -1482,6 +1548,12 @@ fn open_layouts(config: &Config) -> Result<LayoutController, Box<dyn Error>> {
     match backend {
         LayoutBackend::Kde => match KdeLayouts::new() {
             Ok(kde) => {
+                match kde.watch() {
+                    Ok(()) => println!("layoutpilot: KDE layout changes via D-Bus signals"),
+                    Err(error) => {
+                        eprintln!("layoutpilot: KDE layout signals unavailable ({error}); polling");
+                    }
+                }
                 let xkb = match X11LayoutState::new(config.layout_order()) {
                     Ok(xkb) => Some(xkb),
                     Err(error) => {
