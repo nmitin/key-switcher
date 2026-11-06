@@ -425,14 +425,21 @@ impl<D: Detector> Engine<D> {
         } else {
             (self.current_word.clone(), String::new())
         };
-        let (core, suffix) = split_trailing_suffix(&original);
-        if core.is_empty() {
-            return None;
-        }
-        let converted_core =
-            reinterpret_word(core, context.active_layout.table(), target.table()).ok()?;
-        let mut converted = converted_core;
-        converted.push_str(suffix);
+        // A confident reading of trailing punctuation as letters wins
+        // (`pyf.` → `знаю`); otherwise punctuation stays punctuation.
+        let converted = match self.best_split(&original, context, None, 1) {
+            Some(choice) if choice.confidence > 0.5 => choice.converted,
+            _ => {
+                let (core, suffix) = split_trailing_suffix(&original);
+                if core.is_empty() {
+                    return None;
+                }
+                let mut converted =
+                    reinterpret_word(core, context.active_layout.table(), target.table()).ok()?;
+                converted.push_str(suffix);
+                converted
+            }
+        };
         if converted == original || !target.table().can_type(&converted) {
             return None;
         }
@@ -615,45 +622,20 @@ impl<D: Detector> Engine<D> {
             return None;
         }
 
-        let target = context.active_layout.other();
-        let (core, suffix) = split_trailing_suffix(&self.current_word);
-        if core.is_empty() {
-            return None;
-        }
-        let converted_core =
-            reinterpret_word(core, context.active_layout.table(), target.table()).ok()?;
-        let letters = converted_core
-            .chars()
-            .filter(|ch| ch.is_alphabetic())
-            .count();
-        if letters < self.config.min_word_len_for(context.profile) {
-            return None;
-        }
-        let mut converted = converted_core.clone();
-        converted.push_str(suffix);
-        if converted == self.current_word || !target.table().can_type(&converted) {
-            return None;
-        }
-
         let text = self.buffer.text();
         if is_protected_context(&text) {
             return None;
         }
-
         let start = text.rfind(self.current_word.as_str()).unwrap_or(0);
         let previous_word = last_word(&text[..start]).map(|word| word.text);
-        let confidence = self
-            .detector
-            .confidence(&DetectionContext {
-                typed: core,
-                candidate: &converted_core,
-                app_id: context.app_id,
-                previous_word,
-            })
-            .clamp(0.0, 1.0);
-        if confidence < self.config.threshold_for(context.profile) {
+
+        let word = self.current_word.clone();
+        let min_letters = self.config.min_word_len_for(context.profile);
+        let best = self.best_split(&word, context, previous_word, min_letters)?;
+        if best.confidence < self.config.threshold_for(context.profile) {
             return None;
         }
+        let converted = best.converted;
 
         let head = text
             .strip_suffix(self.current_word.as_str())
@@ -690,6 +672,60 @@ impl<D: Detector> Engine<D> {
     /// first word that does not qualify, at a line break or at sentence
     /// punctuation. Words that were corrected earlier are already in the
     /// target script and cannot be reinterpreted, so they stop it too.
+    /// Choose how to read a finished word's trailing punctuation.
+    ///
+    /// `,` `.` `;` `'` `[` `]` at the end of a `us` word are letters in `ru`
+    /// (`pyf.` is `знаю`) but usually sentence punctuation (`ghbdtn,` is
+    /// `привет,`). Every split — from all punctuation to all letters — is
+    /// scored and the most confident wins; ties keep the punctuation.
+    fn best_split(
+        &self,
+        word: &str,
+        context: &InputContext<'_>,
+        previous_word: Option<&str>,
+        min_letters: usize,
+    ) -> Option<SplitChoice> {
+        let source = context.active_layout;
+        let target = source.other();
+        let mut best: Option<SplitChoice> = None;
+        for (core, suffix) in suffix_splits(word, source) {
+            let Ok(converted_core) = reinterpret_word(core, source.table(), target.table()) else {
+                continue;
+            };
+            let letters = converted_core
+                .chars()
+                .filter(|ch| ch.is_alphabetic())
+                .count();
+            if letters < min_letters {
+                continue;
+            }
+            let mut converted = converted_core.clone();
+            converted.push_str(suffix);
+            if converted == word || !target.table().can_type(&converted) {
+                continue;
+            }
+            let confidence = self
+                .detector
+                .confidence(&DetectionContext {
+                    typed: core,
+                    candidate: &converted_core,
+                    app_id: context.app_id,
+                    previous_word,
+                })
+                .clamp(0.0, 1.0);
+            if best
+                .as_ref()
+                .is_none_or(|best| confidence > best.confidence)
+            {
+                best = Some(SplitChoice {
+                    converted,
+                    confidence,
+                });
+            }
+        }
+        best
+    }
+
     /// Learning events since the last call, for persistence. They are
     /// already applied to the detector.
     pub fn take_learning(&mut self) -> Vec<Learning> {
@@ -821,6 +857,31 @@ impl<D: Detector> Engine<D> {
         });
         (confidence >= self.config.lookback_threshold).then_some(candidate)
     }
+}
+
+/// A scored reading of a word's trailing punctuation.
+struct SplitChoice {
+    /// Converted word including the kept punctuation.
+    converted: String,
+    confidence: f32,
+}
+
+/// Ways to split `word` into core and trailing punctuation: first the
+/// sentence-punctuation split, then moving trailing characters that are
+/// letters in the other layout into the core one at a time.
+fn suffix_splits(word: &str, layout: LayoutId) -> Vec<(&str, &str)> {
+    let (core, suffix) = split_trailing_suffix(word);
+    let mut splits = vec![(core, suffix)];
+    let mut end = core.len();
+    for ch in suffix.chars() {
+        if !punctuation_is_letter(ch, layout) {
+            break;
+        }
+        end += ch.len_utf8();
+        splits.push(word.split_at(end));
+    }
+    splits.retain(|(core, _)| !core.is_empty());
+    splits
 }
 
 /// Lowercase word cores of `text` (trailing punctuation dropped).

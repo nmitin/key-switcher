@@ -295,3 +295,44 @@ fn learning_survives_a_replay() {
     assert!(detector.early_confidence_for("rjul", "когд") < 0.01);
     assert_eq!(detector.learned_counts(), (1, 1));
 }
+
+fn auto_result(text: &str, layout: LayoutId) -> String {
+    let mut engine = engine();
+    let context = context(Profile::Auto, layout);
+    for ch in text.chars() {
+        let _ = engine.on_char(ch, &context);
+    }
+    engine.buffer_text()
+}
+
+#[test]
+fn trailing_punctuation_letter_is_read_as_a_letter_when_it_makes_a_word() {
+    assert_eq!(auto_result("pyf. ", LayoutId::Us), "знаю ");
+    assert_eq!(auto_result("z yt pyf. ", LayoutId::Us), "я не знаю ");
+}
+
+#[test]
+fn trailing_punctuation_stays_punctuation_otherwise() {
+    for (typed, expected) in [
+        ("ghbdtn, ", "привет, "),
+        ("ghbdtn. ", "привет. "),
+        ("rfr ltkf, ", "как дела, "),
+        ("rjulf. ", "когда. "),
+        ("ve;xbyf; ", "мужчина; "),
+        ("hello. ", "hello. "),
+        ("etc. ", "etc. "),
+    ] {
+        assert_eq!(auto_result(typed, LayoutId::Us), expected, "{typed:?}");
+    }
+}
+
+#[test]
+fn manual_fix_reads_a_trailing_letter_too() {
+    let manual = context(Profile::Manual, LayoutId::Us);
+    for (typed, expected) in [("pyf.", "знаю"), ("ghbdtn,", "привет,")] {
+        let mut fresh = engine();
+        type_text(&mut fresh, typed, &manual);
+        let correction = fresh.fix_last_word(&manual).expect("fix");
+        assert_eq!(correction.converted, expected, "{typed:?}");
+    }
+}
