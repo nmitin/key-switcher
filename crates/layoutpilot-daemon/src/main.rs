@@ -52,6 +52,14 @@ const IGNORE_WINDOW: Duration = Duration::from_millis(750);
 /// Modifiers are seat-wide on Wayland: a held Shift or Ctrl would combine with
 /// the synthetic Backspace/letters.
 const MODIFIER_RELEASE_WAIT: Duration = Duration::from_millis(300);
+/// How long injection waits for physically held keys to be released.
+///
+/// The compositor ignores a press of a key that is already down on the
+/// seat. An early-trigger correction fires on the press of the word's last
+/// key, and the replacement ends with a letter on that same key (`ghbd` →
+/// `прив`, `d` = `в`): typed while the physical key is still held, that
+/// letter was lost (`Приет`).
+const KEY_RELEASE_WAIT: Duration = Duration::from_millis(300);
 /// Capture threads poll devices every few ms; give them time to deliver keys
 /// pressed during injection before checking for them.
 const CAPTURE_LAG: Duration = Duration::from_millis(10);
@@ -599,6 +607,8 @@ struct Daemon {
     pending_space: bool,
     enter_ignore_until: Instant,
     evdev_modifiers: EvdevModifiers,
+    /// Physically held non-modifier keys (XKB keycodes).
+    held_keys: HashSet<u16>,
     shift_gesture: ShiftGesture,
     last_word_fix_at: Option<Instant>,
     /// Primary selection watcher, when selection conversion is available.
@@ -689,6 +699,7 @@ impl Daemon {
             pending_space: false,
             enter_ignore_until: Instant::now(),
             evdev_modifiers: EvdevModifiers::default(),
+            held_keys: HashSet::new(),
             shift_gesture: ShiftGesture::default(),
             last_word_fix_at: None,
             selection: None,
@@ -811,6 +822,7 @@ impl Daemon {
                 DeviceChange::Removed(info) => {
                     println!("layoutpilot: keyboard removed: {}", device_label(&info));
                     self.evdev_modifiers.release_all();
+                    self.held_keys.clear();
                 }
             }
             self.manager.reset(ResetReason::DeviceChange);
@@ -846,8 +858,12 @@ impl Daemon {
                 // X11 events carry their own state; track held modifiers
                 // only so that injection can wait for their release.
                 if let Some(evdev_keycode) = u16::from(event.keycode).checked_sub(8) {
-                    self.evdev_modifiers
+                    let modifier = self
+                        .evdev_modifiers
                         .update(evdev_keycode, i32::from(event.pressed));
+                    if !modifier {
+                        self.track_held(u16::from(event.keycode), event.pressed);
+                    }
                 }
                 Some(PendingKey {
                     event,
@@ -869,6 +885,9 @@ impl Daemon {
                 }
                 let evdev_keycode = event.keycode.checked_sub(8)?;
                 let modifier = self.evdev_modifiers.update(evdev_keycode, event.value);
+                if !modifier {
+                    self.track_held(event.keycode, event.pressed());
+                }
                 let keycode = u8::try_from(event.keycode).ok()?;
                 Some(PendingKey {
                     event: KeyEvent {
@@ -1625,7 +1644,22 @@ impl Daemon {
                 keys.extend(self.normalize(event));
             }
         }
+        // Keys pressed meanwhile join the tail; their release is awaited too.
+        let deadline = Instant::now() + KEY_RELEASE_WAIT;
+        while !self.held_keys.is_empty() && Instant::now() < deadline {
+            if let Some(event) = self.capture.recv_timeout(Duration::from_millis(5))? {
+                keys.extend(self.normalize(event));
+            }
+        }
         Ok(())
+    }
+
+    fn track_held(&mut self, keycode: u16, pressed: bool) {
+        if pressed {
+            self.held_keys.insert(keycode);
+        } else {
+            self.held_keys.remove(&keycode);
+        }
     }
 
     /// Abandon a plan before anything was injected and process the keys as
