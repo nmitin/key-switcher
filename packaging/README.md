@@ -53,3 +53,17 @@ systemctl --user disable --now layoutpilot.service
 
 Служба запускается после `graphical-session.target`. Если бинарник лежит не в
 `~/.local/bin/layoutpilot`, поправь `ExecStart` в unit-файле.
+
+## Пакет .deb (Debian, Ubuntu, Linux Mint)
+
+```sh
+packaging/deb/build-deb.sh   # -> target/deb/layoutpilot_<версия>_amd64.deb
+```
+
+Бинарник собирается в контейнере `ubuntu:22.04` (нужен Docker), поэтому
+требует glibc ≥ 2.34 и работает на Ubuntu 22.04+, Mint 21+, Debian 12+.
+Пакет ставит `/usr/bin/layoutpilot`, автозапуск в `/etc/xdg/autostart`
+(Cinnamon, MATE, Xfce не поднимают `graphical-session.target`) и
+user-юнит systemd (не включён). Инструкция для пользователя —
+[`deb/README.Debian`](deb/README.Debian). Второй экземпляр демона сразу
+завершается, так что автозапуск и юнит не конфликтуют.

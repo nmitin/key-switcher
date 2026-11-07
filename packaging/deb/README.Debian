@@ -1,0 +1,48 @@
+LayoutPilot для Debian / Ubuntu / Linux Mint
+=============================================
+
+Запуск
+------
+Пакет кладёт автозапуск в /etc/xdg/autostart: демон стартует при входе в
+сеанс. Сразу после установки, без перезахода:
+
+    layoutpilot run &
+
+Отключить автозапуск: «Автозапуск приложений» (Startup Applications) →
+LayoutPilot. Повторный запуск безопасен: второй экземпляр сразу завершится.
+
+Иконка в трее: щелчок — пауза. Двойной Shift — исправить последнее слово,
+тройной — фразу. Хоткеи: Pause — отмена, Ctrl+F8 — исправить слово,
+Ctrl+F9 — пауза.
+
+Проверка окружения:
+
+    layoutpilot doctor
+
+X11 (Cinnamon, MATE, Xfce)
+--------------------------
+Ничего настраивать не нужно: захват через XRecord, ввод через XTest.
+Порядок раскладок (us,ru или ru,us) берётся из текущей раскладки XKB.
+Конвертация выделенного текста двойным Shift работает только на Wayland.
+
+Wayland
+-------
+Нужен доступ к клавиатуре и /dev/uinput:
+
+    sudo install -m 644 /usr/share/doc/layoutpilot/60-layoutpilot.rules /etc/udev/rules.d/
+    sudo udevadm control --reload-rules && sudo udevadm trigger
+
+Для конвертации выделения: sudo apt install wl-clipboard
+
+Настройки
+---------
+~/.config/layoutpilot/config.toml, пример:
+/usr/share/doc/layoutpilot/config.example.toml
+После изменения перезапустите демон (pkill layoutpilot; layoutpilot run &).
+
+Лог при автозапуске — в ~/.xsession-errors.
+
+Вместо автозапуска можно systemd-юнит (если сеанс поднимает
+graphical-session.target):
+
+    systemctl --user enable --now layoutpilot.service

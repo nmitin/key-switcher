@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=LayoutPilot
+Comment=Keyboard layout auto-corrector
+Comment[ru]=Автоисправление раскладки клавиатуры
+Exec=/usr/bin/layoutpilot run
+Icon=input-keyboard
+Terminal=false
+NoDisplay=false
+X-GNOME-Autostart-enabled=true
+X-GNOME-Autostart-Delay=3

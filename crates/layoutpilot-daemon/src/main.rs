@@ -1846,19 +1846,34 @@ fn open_layouts(config: &Config) -> Result<LayoutController, Box<dyn Error>> {
             }
             Err(error) if requested == LayoutBackend::Auto => {
                 eprintln!("layoutpilot: KDE layout backend unavailable ({error}); using XKB");
-                Ok(LayoutController::X11(X11LayoutState::new(
-                    config.layout_order(),
-                )?))
+                Ok(LayoutController::X11(open_xkb(config)?))
             }
             Err(error) => Err(error.into()),
         },
         LayoutBackend::Sway => Ok(LayoutController::Sway(SwayLayouts::new()?)),
         LayoutBackend::Hyprland => Ok(LayoutController::Hyprland(HyprlandLayouts::new()?)),
-        LayoutBackend::X11 => Ok(LayoutController::X11(X11LayoutState::new(
-            config.layout_order(),
-        )?)),
+        LayoutBackend::X11 => Ok(LayoutController::X11(open_xkb(config)?)),
         other => Err(format!("layout backend {other:?} is not wired yet").into()),
     }
+}
+
+/// XKB layout state whose group order follows the active keymap: a desktop
+/// configured as `ru,us` must not be read with the default `us,ru` order.
+fn open_xkb(config: &Config) -> Result<X11LayoutState, Box<dyn Error>> {
+    let mut state = X11LayoutState::new(config.layout_order())?;
+    match state.detect_order() {
+        Some(order) => {
+            if order != state.layouts() {
+                println!("layoutpilot: XKB group order from keymap: {order:?}");
+            }
+            state.set_layouts(order);
+        }
+        None => println!(
+            "layoutpilot: XKB group order not detected; using config {:?}",
+            state.layouts()
+        ),
+    }
+    Ok(state)
 }
 
 fn open_capture(config: &Config) -> Result<Capture, Box<dyn Error>> {
@@ -2176,6 +2191,27 @@ fn parse_args(args: &[String]) -> Result<(Command, Option<PathBuf>), String> {
     Ok((command, config))
 }
 
+/// Make sure only one daemon per user corrects input: two would fix every
+/// word twice. Autostart and the systemd unit can both be enabled by
+/// mistake. The abstract socket disappears with the process, so a crash
+/// leaves nothing stale behind.
+fn claim_instance() -> Result<std::os::unix::net::UnixListener, Box<dyn Error>> {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+
+    let uid = std::fs::metadata("/proc/self")?.uid();
+    let name = format!("layoutpilot-{uid}");
+    let address = SocketAddr::from_abstract_name(name.as_bytes())?;
+    UnixListener::bind_addr(&address).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::AddrInUse {
+            "another layoutpilot is already running for this user".into()
+        } else {
+            Box::<dyn Error>::from(format!("cannot claim instance lock: {error}"))
+        }
+    })
+}
+
 fn main() -> ExitCode {
     let args: Vec<String> = env::args().skip(1).collect();
     let result = (|| -> Result<(), Box<dyn Error>> {
@@ -2199,6 +2235,8 @@ fn main() -> ExitCode {
                     Some(path) => println!("layoutpilot: config {}", path.display()),
                     None => println!("layoutpilot: built-in config"),
                 }
+                // Dry runs may sit next to the live daemon for testing.
+                let _instance = if dry_run { None } else { Some(claim_instance()?) };
                 Daemon::new(dry_run, config)?.run()
             }
         }
