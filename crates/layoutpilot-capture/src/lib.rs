@@ -276,7 +276,7 @@ struct Shared {
 /// Capture from all readable keyboards, including ones plugged in later.
 ///
 /// Every keyboard gets a reader thread doing blocking reads; a scanner thread
-/// rescans `/dev/input` every [`RESCAN_INTERVAL`]. Kernel `SYN_DROPPED`
+/// rescans `/dev/input` every `RESCAN_INTERVAL` (2 s). Kernel `SYN_DROPPED`
 /// overflows are resynchronised by [`evdev::Device::fetch_events`], which
 /// synthesises the missed key state changes.
 #[derive(Debug)]
@@ -381,7 +381,13 @@ fn spawn_reader(
                 .name
                 .clone()
                 .unwrap_or_else(|| info.path.display().to_string());
-            read_device(&mut device, &name, info.pointer, &sender, &thread_shared.stop);
+            read_device(
+                &mut device,
+                &name,
+                info.pointer,
+                &sender,
+                &thread_shared.stop,
+            );
             if let Ok(mut open) = thread_shared.open.lock() {
                 open.remove(&info.path);
             }

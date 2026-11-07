@@ -152,7 +152,9 @@ pub fn read_primary() -> Option<String> {
         "wl-paste",
         None,
     )?;
-    String::from_utf8(bytes).ok().filter(|text| !text.is_empty())
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|text| !text.is_empty())
 }
 
 /// Wait until the primary selection is exactly `text`.
@@ -181,7 +183,11 @@ pub struct SavedClipboard {
 pub fn save_clipboard() -> Option<SavedClipboard> {
     let types = run(&["--list-types"], "wl-paste", None)?;
     let types = String::from_utf8_lossy(&types);
-    let types: Vec<&str> = types.lines().map(str::trim).filter(|t| !t.is_empty()).collect();
+    let types: Vec<&str> = types
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
     let mime = [TEXT_MIME, "text/plain", "UTF8_STRING", "STRING"]
         .into_iter()
         .find(|preferred| types.contains(preferred))
@@ -221,8 +227,17 @@ pub fn restore_clipboard(saved: Option<SavedClipboard>) {
 /// Terminal emulators: selected text there is output, not editable input.
 pub fn is_terminal(app_id: &str) -> bool {
     const TERMINALS: [&str; 11] = [
-        "term", "konsole", "yakuake", "kitty", "alacritty", "foot", "ghostty", "tilix",
-        "guake", "tilda", "urxvt",
+        "term",
+        "konsole",
+        "yakuake",
+        "kitty",
+        "alacritty",
+        "foot",
+        "ghostty",
+        "tilix",
+        "guake",
+        "tilda",
+        "urxvt",
     ];
     let app_id = app_id.to_ascii_lowercase();
     TERMINALS.iter().any(|name| app_id.contains(name))

@@ -250,7 +250,8 @@ impl ShiftGesture {
                 };
                 self.last_press = Some(now);
                 self.broken = false;
-            } else if !self.release(keycode) || self.broken
+            } else if !self.release(keycode)
+                || self.broken
                 || self
                     .last_press
                     .is_some_and(|last| now.duration_since(last) > MAX_SHIFT_TAP)
@@ -778,7 +779,9 @@ impl Daemon {
                     daemon.selection = Some(watch);
                 }
                 Err(error) => {
-                    eprintln!("layoutpilot: selection conversion unavailable (wl-clipboard): {error}");
+                    eprintln!(
+                        "layoutpilot: selection conversion unavailable (wl-clipboard): {error}"
+                    );
                 }
             }
         }
@@ -2317,7 +2320,11 @@ fn main() -> ExitCode {
                     None => println!("layoutpilot: built-in config"),
                 }
                 // Dry runs may sit next to the live daemon for testing.
-                let _instance = if dry_run { None } else { Some(claim_instance()?) };
+                let _instance = if dry_run {
+                    None
+                } else {
+                    Some(claim_instance()?)
+                };
                 Daemon::new(dry_run, config)?.run()
             }
         }

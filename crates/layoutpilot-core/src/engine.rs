@@ -752,7 +752,9 @@ impl<D: Detector> Engine<D> {
         let mut converted = String::with_capacity(text.len());
         let mut rest = text;
         while !rest.is_empty() {
-            let space = rest.find(|ch: char| !ch.is_whitespace()).unwrap_or(rest.len());
+            let space = rest
+                .find(|ch: char| !ch.is_whitespace())
+                .unwrap_or(rest.len());
             converted.push_str(&rest[..space]);
             rest = &rest[space..];
             let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
@@ -1698,7 +1700,10 @@ mod tests {
 
     #[test]
     fn fragment_reads_trailing_punctuation_like_a_word_fix() {
-        assert_eq!(convert("ghbdtn, vbh.").expect("converted").converted, "привет, мир.");
+        assert_eq!(
+            convert("ghbdtn, vbh.").expect("converted").converted,
+            "привет, мир."
+        );
     }
 
     #[test]

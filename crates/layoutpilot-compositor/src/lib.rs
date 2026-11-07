@@ -192,7 +192,7 @@ impl KdeLayouts {
     }
 
     /// Current KDE layout: from the signal cache while subscribed, with a
-    /// D-Bus query at most every [`KDE_RESYNC`].
+    /// D-Bus query at most every `KDE_RESYNC`.
     pub fn current(&self) -> Result<Option<LayoutId>, KdeError> {
         let cached = self.cached.load(Ordering::Acquire);
         let fresh = self
