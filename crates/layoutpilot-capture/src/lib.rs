@@ -57,7 +57,24 @@ const LETTERS: [KeyCode; 26] = [
     KeyCode::KEY_Z,
 ];
 
-/// A device that looks like a keyboard.
+/// Pointer buttons forwarded from mice and touchpads, as XKB keycodes.
+///
+/// Only presses of these buttons are read from pointer devices: a click moves
+/// the text cursor or changes the selection, which the daemon must know.
+/// Motion and scrolling are not key events and never leave the reader.
+pub const POINTER_BUTTONS: [u16; 3] = [
+    xkb_keycode(KeyCode::BTN_LEFT.code()),
+    xkb_keycode(KeyCode::BTN_RIGHT.code()),
+    xkb_keycode(KeyCode::BTN_MIDDLE.code()),
+];
+
+/// Whether an XKB keycode is a pointer button from [`POINTER_BUTTONS`].
+#[must_use]
+pub fn is_pointer_button(keycode: u16) -> bool {
+    POINTER_BUTTONS.contains(&keycode)
+}
+
+/// A keyboard or pointer device being read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyboardInfo {
     /// `/dev/input/eventN` path.
@@ -66,6 +83,8 @@ pub struct KeyboardInfo {
     pub name: Option<String>,
     /// Physical path, if reported by the kernel.
     pub physical_path: Option<String>,
+    /// A mouse or touchpad: only pointer button presses are forwarded.
+    pub pointer: bool,
 }
 
 /// A key event from evdev.
@@ -152,11 +171,42 @@ fn is_keyboard(device: &Device) -> bool {
         .is_some_and(|keys| has_keyboard_keys(keys.iter()))
 }
 
-/// Enumerate readable keyboards.
+/// A mouse or touchpad with a left button that is not also a keyboard.
+fn is_pointer(device: &Device) -> bool {
+    !is_keyboard(device)
+        && device
+            .supported_keys()
+            .is_some_and(|keys| keys.contains(KeyCode::BTN_LEFT))
+}
+
+/// Describe a device worth reading, or `None` for anything else.
+fn source_info(path: PathBuf, device: &Device) -> Option<KeyboardInfo> {
+    if device.name() == Some(layoutpilot_core::VIRTUAL_KEYBOARD_NAME) {
+        // Own injection device: feeding its events back would create a
+        // correction loop.
+        return None;
+    }
+    let pointer = if is_keyboard(device) {
+        false
+    } else if is_pointer(device) {
+        true
+    } else {
+        return None;
+    };
+    Some(KeyboardInfo {
+        path,
+        name: device.name().map(str::to_owned),
+        physical_path: device.physical_path().map(str::to_owned),
+        pointer,
+    })
+}
+
+/// Enumerate readable keyboards and pointer devices.
 ///
 /// Returns [`EvdevError::NoInputDirectory`] when `/dev/input` is absent,
 /// [`EvdevError::PermissionDenied`] when devices exist but cannot be opened,
-/// and [`EvdevError::NoKeyboards`] when no device passes the keyboard filter.
+/// and [`EvdevError::NoKeyboards`] when no device passes the keyboard filter
+/// (pointers alone are not enough).
 pub fn probe_keyboards() -> Result<Vec<KeyboardInfo>, EvdevError> {
     let directory = match fs::read_dir(INPUT_DIR) {
         Ok(directory) => directory,
@@ -183,17 +233,8 @@ pub fn probe_keyboards() -> Result<Vec<KeyboardInfo>, EvdevError> {
 
         match Device::open(&path) {
             Ok(device) => {
-                if device.name() == Some(layoutpilot_core::VIRTUAL_KEYBOARD_NAME) {
-                    // Own injection device: feeding its events back would create
-                    // a correction loop.
-                    continue;
-                }
-                if is_keyboard(&device) {
-                    keyboards.push(KeyboardInfo {
-                        path: path.clone(),
-                        name: device.name().map(str::to_owned),
-                        physical_path: device.physical_path().map(str::to_owned),
-                    });
+                if let Some(info) = source_info(path.clone(), &device) {
+                    keyboards.push(info);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
@@ -203,7 +244,7 @@ pub fn probe_keyboards() -> Result<Vec<KeyboardInfo>, EvdevError> {
         }
     }
 
-    if keyboards.is_empty() {
+    if keyboards.iter().all(|info| info.pointer) {
         if let Some((path, error)) = permission_error {
             return Err(EvdevError::PermissionDenied(path, error));
         }
@@ -340,7 +381,7 @@ fn spawn_reader(
                 .name
                 .clone()
                 .unwrap_or_else(|| info.path.display().to_string());
-            read_device(&mut device, &name, &sender, &thread_shared.stop);
+            read_device(&mut device, &name, info.pointer, &sender, &thread_shared.stop);
             if let Ok(mut open) = thread_shared.open.lock() {
                 open.remove(&info.path);
             }
@@ -385,16 +426,9 @@ fn scan_hotplug(
                 ignored.insert(path);
                 continue;
             };
-            if device.name() == Some(layoutpilot_core::VIRTUAL_KEYBOARD_NAME)
-                || !is_keyboard(&device)
-            {
+            let Some(info) = source_info(path.clone(), &device) else {
                 ignored.insert(path);
                 continue;
-            }
-            let info = KeyboardInfo {
-                path,
-                name: device.name().map(str::to_owned),
-                physical_path: device.physical_path().map(str::to_owned),
             };
             spawn_reader(info.clone(), device, sender, changes, shared);
             if changes.send(DeviceChange::Added(info)).is_err() {
@@ -419,7 +453,13 @@ fn event_nodes() -> io::Result<HashSet<PathBuf>> {
 
 /// Blocking read loop; returns when the device fails (e.g. is unplugged), the
 /// receiver is gone or capture is stopped.
-fn read_device(device: &mut Device, name: &str, sender: &Sender<EvdevKeyEvent>, stop: &AtomicBool) {
+fn read_device(
+    device: &mut Device,
+    name: &str,
+    pointer: bool,
+    sender: &Sender<EvdevKeyEvent>,
+    stop: &AtomicBool,
+) {
     while !stop.load(Ordering::Relaxed) {
         match device.fetch_events() {
             Ok(events) => {
@@ -427,8 +467,14 @@ fn read_device(device: &mut Device, name: &str, sender: &Sender<EvdevKeyEvent>, 
                     if event.event_type() != EventType::KEY {
                         continue;
                     }
+                    let keycode = xkb_keycode(event.code());
+                    // Pointers: button presses only; releases and touches
+                    // carry nothing the daemon needs.
+                    if pointer && (event.value() != 1 || !is_pointer_button(keycode)) {
+                        continue;
+                    }
                     let key = EvdevKeyEvent {
-                        keycode: xkb_keycode(event.code()),
+                        keycode,
                         value: event.value(),
                         device: name.to_owned(),
                     };
@@ -446,6 +492,13 @@ fn read_device(device: &mut Device, name: &str, sender: &Sender<EvdevKeyEvent>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointer_buttons_are_recognised() {
+        assert!(is_pointer_button(280)); // BTN_LEFT 272 + 8
+        assert!(is_pointer_button(281));
+        assert!(!is_pointer_button(38)); // KEY_A
+    }
 
     #[test]
     fn evdev_to_xkb_offset() {

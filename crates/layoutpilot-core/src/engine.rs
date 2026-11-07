@@ -425,21 +425,7 @@ impl<D: Detector> Engine<D> {
         } else {
             (self.current_word.clone(), String::new())
         };
-        // A confident reading of trailing punctuation as letters wins
-        // (`pyf.` → `знаю`); otherwise punctuation stays punctuation.
-        let converted = match self.best_split(&original, context, None, 1) {
-            Some(choice) if choice.confidence > 0.5 => choice.converted,
-            _ => {
-                let (core, suffix) = split_trailing_suffix(&original);
-                if core.is_empty() {
-                    return None;
-                }
-                let mut converted =
-                    reinterpret_word(core, context.active_layout.table(), target.table()).ok()?;
-                converted.push_str(suffix);
-                converted
-            }
-        };
+        let converted = self.manual_convert(&original, context.active_layout, context.app_id)?;
         if converted == original || !target.table().can_type(&converted) {
             return None;
         }
@@ -631,7 +617,13 @@ impl<D: Detector> Engine<D> {
 
         let word = self.current_word.clone();
         let min_letters = self.config.min_word_len_for(context.profile);
-        let best = self.best_split(&word, context, previous_word, min_letters)?;
+        let best = self.best_split(
+            &word,
+            context.active_layout,
+            context.app_id,
+            previous_word,
+            min_letters,
+        )?;
         if best.confidence < self.config.threshold_for(context.profile) {
             return None;
         }
@@ -681,11 +673,11 @@ impl<D: Detector> Engine<D> {
     fn best_split(
         &self,
         word: &str,
-        context: &InputContext<'_>,
+        source: LayoutId,
+        app_id: Option<&str>,
         previous_word: Option<&str>,
         min_letters: usize,
     ) -> Option<SplitChoice> {
-        let source = context.active_layout;
         let target = source.other();
         let mut best: Option<SplitChoice> = None;
         for (core, suffix) in suffix_splits(word, source) {
@@ -709,7 +701,7 @@ impl<D: Detector> Engine<D> {
                 .confidence(&DetectionContext {
                     typed: core,
                     candidate: &converted_core,
-                    app_id: context.app_id,
+                    app_id,
                     previous_word,
                 })
                 .clamp(0.0, 1.0);
@@ -724,6 +716,65 @@ impl<D: Detector> Engine<D> {
             }
         }
         best
+    }
+
+    /// Convert one word typed in `source` for a manual gesture.
+    ///
+    /// A confident reading of trailing punctuation as letters wins
+    /// (`pyf.` → `знаю`); otherwise punctuation stays punctuation. Returns
+    /// `None` when the word cannot be reinterpreted.
+    fn manual_convert(&self, word: &str, source: LayoutId, app_id: Option<&str>) -> Option<String> {
+        if let Some(choice) = self.best_split(word, source, app_id, None, 1) {
+            if choice.confidence > 0.5 {
+                return Some(choice.converted);
+            }
+        }
+        let (core, suffix) = split_trailing_suffix(word);
+        if core.is_empty() {
+            return None;
+        }
+        let mut converted = reinterpret_word(core, source.table(), source.other().table()).ok()?;
+        converted.push_str(suffix);
+        Some(converted)
+    }
+
+    /// Convert a selected text fragment to the other layout.
+    ///
+    /// The source layout is the one most letters belong to. Whitespace is
+    /// kept exactly; every word is converted like a manual word fix, and
+    /// words already written in the target layout (or in neither) are left
+    /// alone, so a half-fixed fragment converts only its mistyped part.
+    /// Returns `None` when nothing would change.
+    #[must_use]
+    pub fn convert_fragment(&self, text: &str, app_id: Option<&str>) -> Option<FragmentConversion> {
+        let source = fragment_source(text)?;
+        let target = source.other();
+        let mut converted = String::with_capacity(text.len());
+        let mut rest = text;
+        while !rest.is_empty() {
+            let space = rest.find(|ch: char| !ch.is_whitespace()).unwrap_or(rest.len());
+            converted.push_str(&rest[..space]);
+            rest = &rest[space..];
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            let word = &rest[..end];
+            rest = &rest[end..];
+            if word.is_empty() {
+                continue;
+            }
+            let in_source = word
+                .chars()
+                .filter(|ch| ch.is_alphabetic())
+                .all(|ch| layout_of_letter(ch) == Some(source));
+            let mapped = in_source
+                .then(|| self.manual_convert(word, source, app_id))
+                .flatten();
+            converted.push_str(mapped.as_deref().unwrap_or(word));
+        }
+        (converted != text).then_some(FragmentConversion {
+            source,
+            target,
+            converted,
+        })
     }
 
     /// Learning events since the last call, for persistence. They are
@@ -857,6 +908,42 @@ impl<D: Detector> Engine<D> {
         });
         (confidence >= self.config.lookback_threshold).then_some(candidate)
     }
+}
+
+/// Result of [`Engine::convert_fragment`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FragmentConversion {
+    /// Layout the fragment was typed in.
+    pub source: LayoutId,
+    /// Layout the fragment was converted to.
+    pub target: LayoutId,
+    /// Converted text.
+    pub converted: String,
+}
+
+/// Which built-in layout a letter is typed in.
+fn layout_of_letter(ch: char) -> Option<LayoutId> {
+    if !ch.is_alphabetic() {
+        return None;
+    }
+    LayoutId::ALL
+        .into_iter()
+        .find(|layout| layout.table().keystroke_for(ch).is_some())
+}
+
+/// Layout most letters of `text` belong to; `None` on a tie or no letters.
+fn fragment_source(text: &str) -> Option<LayoutId> {
+    let mut counts = [0usize; LayoutId::ALL.len()];
+    for ch in text.chars() {
+        if let Some(layout) = layout_of_letter(ch) {
+            if let Some(index) = LayoutId::ALL.iter().position(|id| *id == layout) {
+                counts[index] += 1;
+            }
+        }
+    }
+    let (best, &count) = counts.iter().enumerate().max_by_key(|(_, count)| **count)?;
+    let ties = counts.iter().filter(|other| **other == count).count();
+    (count > 0 && ties == 1).then_some(LayoutId::ALL[best])
 }
 
 /// A scored reading of a word's trailing punctuation.
@@ -1582,5 +1669,43 @@ mod tests {
         let mut engine = Engine::new(EngineConfig::default(), detector());
         let correction = replace(type_text(&mut engine, "Ghbdtn ", &auto()));
         assert_eq!(correction.converted, "Привет");
+    }
+
+    fn convert(text: &str) -> Option<FragmentConversion> {
+        Engine::new(EngineConfig::default(), detector()).convert_fragment(text, None)
+    }
+
+    #[test]
+    fn fragment_converts_every_word_and_keeps_whitespace() {
+        let result = convert("Ghbdtn,  vbh\n\tgh").expect("converted");
+        assert_eq!(result.source, LayoutId::Us);
+        assert_eq!(result.target, LayoutId::Ru);
+        assert_eq!(result.converted, "Привет,  мир\n\tпр");
+    }
+
+    #[test]
+    fn fragment_converts_russian_to_english() {
+        let result = convert("руддщ цщкдв").expect("converted");
+        assert_eq!(result.source, LayoutId::Ru);
+        assert_eq!(result.converted, "hello world");
+    }
+
+    #[test]
+    fn fragment_keeps_words_already_in_the_target_layout() {
+        let result = convert("привет vbh ;bpym").expect("converted");
+        assert_eq!(result.converted, "привет мир жизнь");
+    }
+
+    #[test]
+    fn fragment_reads_trailing_punctuation_like_a_word_fix() {
+        assert_eq!(convert("ghbdtn, vbh.").expect("converted").converted, "привет, мир.");
+    }
+
+    #[test]
+    fn fragment_without_letters_or_changes_is_ignored() {
+        assert_eq!(convert(""), None);
+        assert_eq!(convert("123 - 45"), None);
+        // Tie: no majority layout.
+        assert_eq!(convert("ab гд"), None);
     }
 }

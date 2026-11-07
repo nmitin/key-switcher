@@ -10,6 +10,7 @@
 mod kde_focus;
 mod learned;
 mod screen_lock;
+mod selection;
 mod tail;
 mod tray;
 
@@ -37,6 +38,7 @@ use layoutpilot_x11::{
     XRecordCapture,
 };
 use screen_lock::ScreenLock;
+use selection::SelectionWatch;
 use tail::{tail_text, Blocked, PendingKey};
 use tray::{TrayCommand, TrayHandle, TrayState};
 
@@ -107,6 +109,37 @@ impl Hotkeys {
             Some(HotkeyAction::Fix)
         } else {
             None
+        }
+    }
+}
+
+/// Longest selection the gesture converts.
+const MAX_SELECTION_CHARS: usize = 10_000;
+/// Longest pasted fragment that is selected again with Shift+Left.
+const MAX_RESELECT_CHARS: usize = 2_000;
+/// Time the application gets to read the clipboard after Ctrl+V.
+const PASTE_SETTLE: Duration = Duration::from_millis(300);
+
+/// A selection conversion that can still be toggled back.
+#[derive(Debug, Clone)]
+struct SelectionFix {
+    /// Text before the last paste.
+    original: String,
+    /// Text now in the document.
+    converted: String,
+    /// Layout of `original`.
+    source: LayoutId,
+    /// Layout of `converted`.
+    target: LayoutId,
+}
+
+impl SelectionFix {
+    fn reversed(self) -> Self {
+        Self {
+            original: self.converted,
+            converted: self.original,
+            source: self.target,
+            target: self.source,
         }
     }
 }
@@ -364,6 +397,36 @@ impl Injector {
         }
     }
 
+    fn select_left(&mut self, count: usize) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::X11(injector) => {
+                // XKB keycodes: Shift_L 50, Left 113.
+                injector.press_keycode(50)?;
+                for _ in 0..count {
+                    injector.press_keycode(113)?;
+                    injector.release_keycode(113)?;
+                }
+                injector.release_keycode(50)?;
+                Ok(())
+            }
+            Self::Uinput(injector) => Ok(injector.select_left(count)?),
+        }
+    }
+
+    fn tap_paste(&mut self) -> Result<(), Box<dyn Error>> {
+        match self {
+            Self::X11(injector) => {
+                // XKB keycodes: Control_L 37, V 55.
+                injector.press_keycode(37)?;
+                injector.press_keycode(55)?;
+                injector.release_keycode(55)?;
+                injector.release_keycode(37)?;
+                Ok(())
+            }
+            Self::Uinput(injector) => Ok(injector.tap_paste()?),
+        }
+    }
+
     fn tap_text(&mut self, text: &str, layout: &LayoutTable) -> Result<(), Box<dyn Error>> {
         match self {
             Self::X11(injector) => Ok(injector.tap_text(text, layout)?),
@@ -538,6 +601,14 @@ struct Daemon {
     evdev_modifiers: EvdevModifiers,
     shift_gesture: ShiftGesture,
     last_word_fix_at: Option<Instant>,
+    /// Primary selection watcher, when selection conversion is available.
+    selection: Option<SelectionWatch>,
+    /// Selection generation at the last key press or click; a higher current
+    /// generation means the user selected text after that.
+    selection_seen: u64,
+    /// Last selection conversion, while nothing was typed after it.
+    selection_fix: Option<SelectionFix>,
+    last_selection_fix_at: Option<Instant>,
     tray: Option<TrayHandle>,
     /// Runtime override from the tray: `manual` apps (terminals) become `auto`.
     terminals_auto: bool,
@@ -620,6 +691,10 @@ impl Daemon {
             evdev_modifiers: EvdevModifiers::default(),
             shift_gesture: ShiftGesture::default(),
             last_word_fix_at: None,
+            selection: None,
+            selection_seen: 0,
+            selection_fix: None,
+            last_selection_fix_at: None,
             tray: None,
             terminals_auto: false,
             focus_changed_at: None,
@@ -634,6 +709,20 @@ impl Daemon {
         }
         if daemon.config.privacy.learning {
             daemon.load_learning();
+        }
+        if daemon.config.general.double_shift_selection
+            && daemon.config.general.double_shift_fix
+            && is_wayland_session()
+        {
+            match SelectionWatch::start() {
+                Ok(watch) => {
+                    println!("layoutpilot: selection conversion via wl-paste");
+                    daemon.selection = Some(watch);
+                }
+                Err(error) => {
+                    eprintln!("layoutpilot: selection conversion unavailable (wl-clipboard): {error}");
+                }
+            }
         }
         if daemon.config.general.tray {
             let state = TrayState {
@@ -772,6 +861,12 @@ impl Daemon {
                     // before injection.
                     return None;
                 }
+                if layoutpilot_capture::is_pointer_button(event.keycode) {
+                    if event.pressed() {
+                        self.on_pointer_press();
+                    }
+                    return None;
+                }
                 let evdev_keycode = event.keycode.checked_sub(8)?;
                 let modifier = self.evdev_modifiers.update(evdev_keycode, event.value);
                 let keycode = u8::try_from(event.keycode).ok()?;
@@ -836,6 +931,11 @@ impl Daemon {
             return Ok(());
         }
         self.last_input = Instant::now();
+        // X11 capture delivers Shift here too; it must not end a selection.
+        if !SHIFT_KEYCODES.contains(&event.keycode) {
+            self.mark_selection_seen();
+            self.selection_fix = None;
+        }
 
         if let Some(action) = self.hotkeys.action(u16::from(event.keycode), event.state) {
             if !self.grabbed_hotkeys.contains(&action) {
@@ -940,10 +1040,18 @@ impl Daemon {
     ) -> Result<(), Box<dyn Error>> {
         match action {
             ShiftGestureAction::Word => {
-                if self.manual_fix_word(event)? {
+                if self.fix_selection()? {
+                    self.last_word_fix_at = None;
+                    self.last_selection_fix_at = Some(Instant::now());
+                } else if self.manual_fix_word(event)? {
                     self.last_word_fix_at = Some(Instant::now());
                 }
             }
+            // The third tap of a selection conversion is not a phrase fix.
+            ShiftGestureAction::Phrase
+                if self
+                    .last_selection_fix_at
+                    .is_some_and(|at| at.elapsed() < Duration::from_millis(800)) => {}
             ShiftGestureAction::Phrase if self.config.general.triple_shift_phrase => {
                 // A third tap arrives after the second one already fixed the
                 // word. Roll that fix back first so the phrase is converted
@@ -969,6 +1077,169 @@ impl Daemon {
             ShiftGestureAction::Phrase => {}
         }
         Ok(())
+    }
+
+    /// A click moves the cursor or the selection: typed context is stale.
+    fn on_pointer_press(&mut self) {
+        self.mark_selection_seen();
+        self.selection_fix = None;
+        self.shift_gesture.reset();
+        self.pending_space = false;
+        self.manager.reset(ResetReason::PointerActivity);
+    }
+
+    fn mark_selection_seen(&mut self) {
+        if let Some(watch) = self.selection.as_ref() {
+            self.selection_seen = watch.generation();
+        }
+    }
+
+    /// Convert text selected since the last key press or click, or flip
+    /// the fragment converted just before back. Returns `true` when the
+    /// gesture was consumed; `false` lets it fall back to the word fix.
+    fn fix_selection(&mut self) -> Result<bool, Box<dyn Error>> {
+        let Some(watch) = self.selection.as_ref() else {
+            return Ok(false);
+        };
+        let generation = watch.generation();
+        let fresh = generation != self.selection_seen;
+        self.selection_seen = generation;
+        if self.profile == Profile::Off
+            || self.app_id.as_deref().is_some_and(selection::is_terminal)
+        {
+            return Ok(false);
+        }
+        if !fresh && self.selection_fix.is_none() {
+            return Ok(false);
+        }
+        // An empty primary selection means it was cleared, not made.
+        let Some(text) = selection::read_primary() else {
+            return Ok(false);
+        };
+        // The converted fragment is still selected: flip it back.
+        if let Some(fix) = self.selection_fix.take() {
+            if text == fix.converted {
+                self.apply_selection_fix(fix.reversed(), "Selection undo");
+                return Ok(true);
+            }
+        }
+        if !fresh {
+            return Ok(false);
+        }
+        // From here on text is selected: a word fix would send Backspace and
+        // delete the selection, so the gesture is consumed either way.
+        if text.chars().count() > MAX_SELECTION_CHARS {
+            println!("layoutpilot: selection too long to convert");
+            return Ok(true);
+        }
+        let app_id = self.app_id.clone();
+        let Some(conversion) = self
+            .manager
+            .engine()
+            .convert_fragment(&text, app_id.as_deref())
+        else {
+            println!("layoutpilot: selection has nothing to convert");
+            return Ok(true);
+        };
+        let fix = SelectionFix {
+            original: text,
+            converted: conversion.converted,
+            source: conversion.source,
+            target: conversion.target,
+        };
+        self.apply_selection_fix(fix, "Selection");
+        self.manager.reset(ResetReason::Manual);
+        Ok(true)
+    }
+
+    /// Flip the converted fragment back (undo hotkey).
+    fn toggle_selection_fix(&mut self) -> Result<(), Box<dyn Error>> {
+        let Some(fix) = self.selection_fix.take() else {
+            return Ok(());
+        };
+        if selection::read_primary().as_deref() == Some(fix.converted.as_str()) {
+            self.apply_selection_fix(fix.reversed(), "Selection undo");
+        } else {
+            println!("layoutpilot: converted fragment is no longer selected");
+        }
+        Ok(())
+    }
+
+    /// Replace the selection with `fix.converted` and remember the fix when
+    /// the new text ends up selected again.
+    fn apply_selection_fix(&mut self, fix: SelectionFix, label: &str) {
+        match self.paste_over_selection(&fix.converted, fix.target) {
+            Ok(reselected) => {
+                println!(
+                    "layoutpilot: {label} → layout {}, {} chars{}",
+                    fix.target,
+                    fix.converted.chars().count(),
+                    if reselected { "" } else { ", not reselected" }
+                );
+                if let Some(tray) = self.tray.as_mut() {
+                    tray.correction(&fix.original, &fix.converted);
+                }
+                self.last_selection_fix_at = Some(Instant::now());
+                self.selection_fix = reselected.then_some(fix);
+            }
+            Err(error) => eprintln!("layoutpilot: selection conversion failed: {error}"),
+        }
+    }
+
+    /// Paste `text` over the current selection through the clipboard, switch
+    /// to `layout` and select the pasted text again. Returns whether the
+    /// pasted text is selected afterwards.
+    fn paste_over_selection(
+        &mut self,
+        text: &str,
+        layout: LayoutId,
+    ) -> Result<bool, Box<dyn Error>> {
+        if self.dry_run {
+            println!("[dry-run] Selection: layout={layout}, text={text:?}");
+            return Ok(false);
+        }
+        if self.evdev_modifiers.any_held() {
+            return Err("modifier held".into());
+        }
+        let saved = if self.config.inject.restore_clipboard {
+            selection::save_clipboard()
+        } else {
+            None
+        };
+        if !selection::set_clipboard(text) {
+            if self.config.inject.restore_clipboard {
+                selection::restore_clipboard(saved);
+            }
+            return Err("could not put the conversion on the clipboard".into());
+        }
+        // Paste before switching: the shortcut is safest in the layout the
+        // application already has.
+        self.injector.tap_paste()?;
+        self.remember_own_events();
+        let previous_layout = self.active_layout;
+        self.layouts.switch_to(layout)?;
+        self.active_layout = Some(layout);
+        if previous_layout != Some(layout) {
+            self.sound.play();
+        }
+        // The application reads the clipboard asynchronously after Ctrl+V;
+        // selecting before the text arrives would select the wrong range.
+        std::thread::sleep(PASTE_SETTLE);
+        if self.config.inject.restore_clipboard {
+            selection::restore_clipboard(saved);
+        }
+        let chars = text.chars().count();
+        let reselected = chars <= MAX_RESELECT_CHARS && {
+            self.injector.select_left(chars)?;
+            self.remember_own_events();
+            selection::wait_primary(text)
+        };
+        // Our own selection is not a selection made by the user.
+        if let Some(watch) = self.selection.as_ref() {
+            watch.wait_change(self.selection_seen);
+        }
+        self.mark_selection_seen();
+        Ok(reselected)
     }
 
     fn manual_fix_word(&mut self, event: &KeyEvent) -> Result<bool, Box<dyn Error>> {
@@ -1108,13 +1379,17 @@ impl Daemon {
                 if self.paused {
                     return Ok(());
                 }
+                if self.selection_fix.is_some() {
+                    self.toggle_selection_fix()?;
+                    return Ok(());
+                }
                 match self.manager.undo() {
                     Some(plan) => self.apply(plan)?,
                     None => println!("layoutpilot: undo unavailable"),
                 }
             }
             HotkeyAction::Fix => {
-                if self.paused {
+                if self.paused || self.fix_selection()? {
                     return Ok(());
                 }
                 let app_id = self.app_id.clone();
@@ -1449,6 +1724,7 @@ impl Daemon {
                 "layoutpilot: focus window={:?}, app={:?}, profile={:?}",
                 self.window, self.app_id, self.profile
             );
+            self.selection_fix = None;
             if self.clear_on_focus_change {
                 self.manager.reset(ResetReason::FocusChange);
             }

@@ -15,6 +15,7 @@ sound_file = "/usr/share/sounds/freedesktop/stereo/camera-shutter.oga"
 backspace_undo = false
 double_shift_fix = true             # двойной Shift — последнее слово
 triple_shift_phrase = true          # тройной Shift — вся фраза
+double_shift_selection = true       # двойной Shift после выделения — выделенный фрагмент
 early_trigger = false               # исправлять посреди слова, без пробела: ghbd → прив…
 tray = true                         # иконка в трее: пауза, индикатор коррекций
 lookback_words = 4                  # короткие слова перед исправленным: f jy yt ghbitk → а он не пришел; 0 — выкл.

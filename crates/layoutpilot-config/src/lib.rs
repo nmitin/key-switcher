@@ -231,6 +231,9 @@ pub struct GeneralConfig {
     pub double_shift_fix: bool,
     /// Triple Shift fixes the whole current phrase.
     pub triple_shift_phrase: bool,
+    /// Double Shift right after selecting text converts the selection
+    /// (Wayland, needs `wl-clipboard`).
+    pub double_shift_selection: bool,
     /// Preceding short words converted together with a corrected word.
     pub lookback_words: usize,
     /// Show a system tray icon (pause/resume, correction indicator).
@@ -255,6 +258,7 @@ impl Default for GeneralConfig {
             backspace_undo: false,
             double_shift_fix: true,
             triple_shift_phrase: true,
+            double_shift_selection: true,
             lookback_words: 4,
             tray: true,
             early_trigger: false,
@@ -649,6 +653,7 @@ mod tests {
         assert!(!config.general.backspace_undo);
         assert!(config.general.double_shift_fix);
         assert!(config.general.triple_shift_phrase);
+        assert!(config.general.double_shift_selection);
         assert_eq!(config.layout.backend, LayoutBackend::Auto);
         assert_eq!(config.layout.order, vec![LayoutCode::Us, LayoutCode::Ru]);
         assert!(!config.privacy.store_keystrokes);

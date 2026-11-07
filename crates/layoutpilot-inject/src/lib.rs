@@ -33,6 +33,17 @@ pub const SHIFT_KEYCODE: u16 = 50;
 
 const EVDEV_KEY_LEFTSHIFT: u16 = 42;
 const EVDEV_KEY_LEFTCTRL: u16 = 29;
+const EVDEV_KEY_V: u16 = 47;
+const EVDEV_KEY_LEFT: u16 = 105;
+
+/// Keys sent back to back before a pause.
+///
+/// The kernel keeps a small queue per evdev reader (about 64 events, four per
+/// key tap). A long burst of taps overflows it before the compositor reads,
+/// and the compositor drops the rest (`SYN_DROPPED`): 50 Backspace became
+/// 24–30 in practice. Pausing every few taps lets it catch up.
+const BURST_TAPS: u32 = 8;
+const BURST_PAUSE: std::time::Duration = std::time::Duration::from_millis(4);
 const EVDEV_KEY_BACKSPACE: u16 = 14;
 const EVDEV_KEY_ENTER: u16 = 28;
 const EVDEV_KEY_TAB: u16 = 15;
@@ -73,6 +84,8 @@ impl From<io::Error> for InjectError {
 pub struct UinputInjector {
     device: VirtualDevice,
     pressed: Vec<u16>,
+    /// Taps since the last pause, see [`BURST_TAPS`].
+    burst: u32,
 }
 
 impl UinputInjector {
@@ -92,6 +105,7 @@ impl UinputInjector {
         Ok(Self {
             device,
             pressed: Vec::new(),
+            burst: 0,
         })
     }
 
@@ -108,6 +122,25 @@ impl UinputInjector {
         self.press(EVDEV_KEY_LEFTCTRL)?;
         self.press(EVDEV_KEY_BACKSPACE)?;
         self.release(EVDEV_KEY_BACKSPACE)?;
+        self.release(EVDEV_KEY_LEFTCTRL)?;
+        Ok(())
+    }
+
+    /// Select `count` characters to the left of the cursor (Shift+Left).
+    pub fn select_left(&mut self, count: usize) -> Result<(), InjectError> {
+        self.press(EVDEV_KEY_LEFTSHIFT)?;
+        for _ in 0..count {
+            self.tap_key(EVDEV_KEY_LEFT + EVDEV_TO_XKB_OFFSET, false)?;
+        }
+        self.release(EVDEV_KEY_LEFTSHIFT)?;
+        Ok(())
+    }
+
+    /// Paste with Ctrl+V.
+    pub fn tap_paste(&mut self) -> Result<(), InjectError> {
+        self.press(EVDEV_KEY_LEFTCTRL)?;
+        self.press(EVDEV_KEY_V)?;
+        self.release(EVDEV_KEY_V)?;
         self.release(EVDEV_KEY_LEFTCTRL)?;
         Ok(())
     }
@@ -140,6 +173,11 @@ impl UinputInjector {
         self.release(evdev)?;
         if shift {
             self.release(EVDEV_KEY_LEFTSHIFT)?;
+        }
+        self.burst += 1;
+        if self.burst >= BURST_TAPS {
+            self.burst = 0;
+            std::thread::sleep(BURST_PAUSE);
         }
         Ok(())
     }
