@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 use layoutpilot_capture::{DeviceChange, EvdevCapture, EvdevKeyEvent};
 use layoutpilot_compositor::{HyprlandLayouts, KdeLayouts, SwayLayouts};
 use layoutpilot_config::{
-    CaptureBackend, Config, DeleteMode, Hotkey, InjectBackend, LayoutBackend, Trigger,
+    CaptureBackend, Config, DeleteMode, Hotkey, InjectBackend, LayoutBackend, ShiftKeys, Trigger,
 };
 use layoutpilot_core::{
     CorrectionManager, CorrectionPlan, InputContext, LayoutId, LayoutTable, PlanKind, Profile,
@@ -164,30 +164,67 @@ enum ShiftGestureAction {
     Phrase,
 }
 
+/// Longest press that still counts as a Shift tap. A Shift held longer is
+/// being used as a modifier (Shift+click, holding it while thinking) and
+/// must not fire a gesture on release.
+const MAX_SHIFT_TAP: Duration = Duration::from_millis(300);
+
 /// Double Shift fixes the last word, triple Shift the phrase.
 ///
-/// Any other key breaks the sequence. The action fires on release so that no
-/// synthetic character is typed while a physical Shift is still held.
+/// Any other key — including a Shift excluded by `shift_gesture_keys` —
+/// breaks the sequence, and so does a Shift held longer than
+/// [`MAX_SHIFT_TAP`]. The action fires on release so that no synthetic
+/// character is typed while a physical Shift is still held.
 #[derive(Debug)]
 struct ShiftGesture {
     count: u8,
     last_press: Option<Instant>,
     broken: bool,
     window: Duration,
+    keys: Vec<u8>,
+    /// Gesture Shift keys currently held.
+    down: Vec<u8>,
 }
 
 impl Default for ShiftGesture {
     fn default() -> Self {
+        Self::new(ShiftKeys::Both)
+    }
+}
+
+impl ShiftGesture {
+    fn new(keys: ShiftKeys) -> Self {
+        let keys = match keys {
+            ShiftKeys::Both => SHIFT_KEYCODES.to_vec(),
+            ShiftKeys::Left => vec![SHIFT_KEYCODES[0]],
+            ShiftKeys::Right => vec![SHIFT_KEYCODES[1]],
+        };
         Self {
             count: 0,
             last_press: None,
             broken: false,
             window: Duration::from_millis(400),
+            keys,
+            down: Vec::new(),
         }
     }
-}
 
-impl ShiftGesture {
+    /// Forget everything, including held keys: used while input is not
+    /// observed (pause, screen lock), when releases may be missed.
+    fn clear(&mut self) {
+        self.reset();
+        self.down.clear();
+    }
+
+    /// Forget a held key; `false` if it was not seen going down.
+    fn release(&mut self, keycode: u8) -> bool {
+        let held = self.down.contains(&keycode);
+        self.down.retain(|key| *key != keycode);
+        held
+    }
+
+    /// Forget the sequence. Held keys stay tracked so their autorepeat and
+    /// release are still recognised.
     fn reset(&mut self) {
         self.count = 0;
         self.last_press = None;
@@ -196,8 +233,13 @@ impl ShiftGesture {
 
     /// Feed one key event; returns an action when a sequence is released.
     fn on_key(&mut self, keycode: u8, pressed: bool, now: Instant) -> Option<ShiftGestureAction> {
-        if SHIFT_KEYCODES.contains(&keycode) {
+        if self.keys.contains(&keycode) {
             if pressed {
+                // Autorepeat of a held Shift is not a new tap.
+                if self.down.contains(&keycode) {
+                    return None;
+                }
+                self.down.push(keycode);
                 self.count = if self
                     .last_press
                     .is_some_and(|last| now.duration_since(last) <= self.window)
@@ -208,7 +250,11 @@ impl ShiftGesture {
                 };
                 self.last_press = Some(now);
                 self.broken = false;
-            } else if self.broken {
+            } else if !self.release(keycode) || self.broken
+                || self
+                    .last_press
+                    .is_some_and(|last| now.duration_since(last) > MAX_SHIFT_TAP)
+            {
                 self.reset();
             } else if self.count == 2 {
                 // Keep the counter: a third quick tap upgrades the gesture to
@@ -633,6 +679,7 @@ struct Daemon {
 
 impl Daemon {
     fn new(dry_run: bool, config: Config) -> Result<Self, Box<dyn Error>> {
+        let shift_keys = config.general.shift_gesture_keys;
         let mut injector = open_injector(&config)?;
         if config.inject.request_permission_on_start && !dry_run && is_wayland_session() {
             println!("layoutpilot: requesting input-injection permission (Shift tap)");
@@ -700,7 +747,7 @@ impl Daemon {
             enter_ignore_until: Instant::now(),
             evdev_modifiers: EvdevModifiers::default(),
             held_keys: HashSet::new(),
-            shift_gesture: ShiftGesture::default(),
+            shift_gesture: ShiftGesture::new(shift_keys),
             last_word_fix_at: None,
             selection: None,
             selection_seen: 0,
@@ -840,7 +887,7 @@ impl Daemon {
             self.backlog.clear();
             self.pending_space = false;
             self.pending_enter = false;
-            self.shift_gesture.reset();
+            self.shift_gesture.clear();
             println!("layoutpilot: screen locked, input ignored");
         } else {
             println!("layoutpilot: screen unlocked");
@@ -908,7 +955,7 @@ impl Daemon {
         }
         // Modifiers never reach handle_key, so feed the Shift gesture here.
         if self.paused {
-            self.shift_gesture.reset();
+            self.shift_gesture.clear();
         } else if self.config.general.double_shift_fix {
             if let Some(action) =
                 self.shift_gesture
@@ -963,7 +1010,7 @@ impl Daemon {
             return Ok(());
         }
         if self.paused {
-            self.shift_gesture.reset();
+            self.shift_gesture.clear();
             return Ok(());
         }
 
@@ -1339,7 +1386,7 @@ impl Daemon {
         self.paused = !self.paused;
         if self.paused {
             self.manager.pause();
-            self.shift_gesture.reset();
+            self.shift_gesture.clear();
             println!("layoutpilot: paused");
         } else {
             self.manager.resume();
@@ -2378,6 +2425,47 @@ mod tests {
         assert_eq!(
             gesture.on_key(50, false, start + Duration::from_millis(100)),
             Some(ShiftGestureAction::Phrase)
+        );
+    }
+
+    #[test]
+    fn held_shift_with_autorepeat_does_not_fire() {
+        let start = Instant::now();
+        let mut gesture = ShiftGesture::default();
+        let at = |ms| start + Duration::from_millis(ms);
+        // Quick tap, then a long hold that autorepeats.
+        assert_eq!(gesture.on_key(50, true, at(0)), None);
+        assert_eq!(gesture.on_key(50, false, at(50)), None);
+        assert_eq!(gesture.on_key(50, true, at(150)), None);
+        for ms in [650, 683, 716, 749] {
+            assert_eq!(gesture.on_key(50, true, at(ms)), None);
+        }
+        assert_eq!(gesture.on_key(50, false, at(1500)), None);
+        // A normal double tap still works afterwards.
+        assert_eq!(gesture.on_key(50, true, at(3000)), None);
+        assert_eq!(gesture.on_key(50, false, at(3050)), None);
+        assert_eq!(gesture.on_key(50, true, at(3150)), None);
+        assert_eq!(
+            gesture.on_key(50, false, at(3200)),
+            Some(ShiftGestureAction::Word)
+        );
+    }
+
+    #[test]
+    fn right_shift_only_ignores_left_shift_taps() {
+        let start = Instant::now();
+        let mut gesture = ShiftGesture::new(ShiftKeys::Right);
+        let at = |ms| start + Duration::from_millis(ms);
+        for (ms, pressed) in [(0, true), (50, false), (100, true)] {
+            assert_eq!(gesture.on_key(50, pressed, at(ms)), None);
+        }
+        assert_eq!(gesture.on_key(50, false, at(150)), None);
+        assert_eq!(gesture.on_key(62, true, at(300)), None);
+        assert_eq!(gesture.on_key(62, false, at(350)), None);
+        assert_eq!(gesture.on_key(62, true, at(400)), None);
+        assert_eq!(
+            gesture.on_key(62, false, at(450)),
+            Some(ShiftGestureAction::Word)
         );
     }
 

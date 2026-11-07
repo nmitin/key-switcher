@@ -94,6 +94,19 @@ pub enum InjectBackend {
     Clipboard,
 }
 
+/// Which Shift keys count for the double/triple Shift gestures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum ShiftKeys {
+    /// Either Shift.
+    #[default]
+    Both,
+    /// Left Shift only; right Shift is an ordinary modifier.
+    Left,
+    /// Right Shift only; left Shift is an ordinary modifier.
+    Right,
+}
+
 /// How the injector removes the mistyped word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -234,6 +247,8 @@ pub struct GeneralConfig {
     /// Double Shift right after selecting text converts the selection
     /// (Wayland, needs `wl-clipboard`).
     pub double_shift_selection: bool,
+    /// Shift keys used by the gestures.
+    pub shift_gesture_keys: ShiftKeys,
     /// Preceding short words converted together with a corrected word.
     pub lookback_words: usize,
     /// Show a system tray icon (pause/resume, correction indicator).
@@ -259,6 +274,7 @@ impl Default for GeneralConfig {
             double_shift_fix: true,
             triple_shift_phrase: true,
             double_shift_selection: true,
+            shift_gesture_keys: ShiftKeys::Both,
             lookback_words: 4,
             tray: true,
             early_trigger: false,
@@ -654,6 +670,7 @@ mod tests {
         assert!(config.general.double_shift_fix);
         assert!(config.general.triple_shift_phrase);
         assert!(config.general.double_shift_selection);
+        assert_eq!(config.general.shift_gesture_keys, ShiftKeys::Both);
         assert_eq!(config.layout.backend, LayoutBackend::Auto);
         assert_eq!(config.layout.order, vec![LayoutCode::Us, LayoutCode::Ru]);
         assert!(!config.privacy.store_keystrokes);
